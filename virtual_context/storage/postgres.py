@@ -7441,6 +7441,36 @@ class PostgresStore(ContextStore):
                         context_updates.append((seq, int(row["id"])))
 
                 if context_updates:
+                    # Two-pass UPDATE to avoid intermediate-state
+                    # collisions against
+                    # ``idx_request_context_conv_turn_unique``.
+                    # PostgreSQL evaluates the unique constraint at
+                    # statement end, so a sequential UPDATE that
+                    # assigns row A to a ``request_turn`` value some
+                    # other row B currently holds raises
+                    # ``UniqueViolation`` even though the final
+                    # post-normalization state would have no
+                    # duplicates. The collision happens whenever the
+                    # kept rows for a conversation are NOT monotonic
+                    # in (id, request_turn); a typical trigger is a
+                    # post-VCMERGE state where source rows arrive at
+                    # offset request_turn values and a later trim
+                    # leaves a non-monotonic kept set.
+                    #
+                    # Pass 1 stages every row needing update to a
+                    # unique negative sentinel (-id is guaranteed
+                    # unique within and across conversations because
+                    # id is the SERIAL PK). Pass 2 sets each row to
+                    # its final positive target sequence.
+                    # Already-normalized rows (not in
+                    # ``context_updates``) keep their positive values,
+                    # which by definition equal their target seq so
+                    # they cannot collide with any other row's target.
+                    for _seq, row_id in context_updates:
+                        conn.execute(
+                            "UPDATE request_context SET request_turn = %s WHERE id = %s",
+                            (-row_id, row_id),
+                        )
                     for params in context_updates:
                         conn.execute(
                             "UPDATE request_context SET request_turn = %s WHERE id = %s",

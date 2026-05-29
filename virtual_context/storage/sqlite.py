@@ -1960,10 +1960,60 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 context_updates.append((seq, int(row["id"])))
 
         if context_updates:
-            conn.executemany(
-                "UPDATE request_context SET request_turn = ? WHERE id = ?",
-                context_updates,
-            )
+            # Two-pass UPDATE to avoid intermediate-state collisions
+            # against ``idx_request_context_conv_turn_unique``. SQLite
+            # (and Postgres) evaluate the unique constraint at
+            # statement end, so a sequential UPDATE that assigns row A
+            # to a ``request_turn`` value some other row B currently
+            # holds raises IntegrityError even when the final
+            # post-normalization state would have no duplicates. The
+            # collision happens whenever the kept rows for a
+            # conversation are NOT monotonic in (id, request_turn);
+            # a typical trigger is a post-VCMERGE state where source
+            # rows arrive at offset request_turn values and a later
+            # trim leaves a non-monotonic kept set.
+            #
+            # Pass 1 stages every row needing update to a unique
+            # negative sentinel (-id is guaranteed unique within and
+            # across conversations because id is the INTEGER PRIMARY KEY).
+            # Pass 2 sets each row to its final positive target sequence.
+            # Already-normalized rows (not in ``context_updates``)
+            # keep their positive values, which by definition equal
+            # their target seq so they cannot collide with any other
+            # row's target seq.
+            #
+            # Both passes execute inside a single BEGIN IMMEDIATE /
+            # COMMIT block so a crash between pass 1 and pass 2 rolls
+            # back the negative sentinels rather than leaving them
+            # committed in the table. The SQLite connection runs at
+            # ``isolation_level=None`` (autocommit) so without this
+            # explicit transaction each executemany would auto-commit
+            # individually. When a caller has already opened a
+            # transaction on this connection (``conn.in_transaction``
+            # is True) the two passes ride that outer transaction and
+            # we skip the local BEGIN/COMMIT to avoid nesting.
+            pass_one = [(-row_id, row_id) for _seq, row_id in context_updates]
+            own_txn = not conn.in_transaction
+            if own_txn:
+                conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.executemany(
+                    "UPDATE request_context SET request_turn = ? WHERE id = ?",
+                    pass_one,
+                )
+                conn.executemany(
+                    "UPDATE request_context SET request_turn = ? WHERE id = ?",
+                    context_updates,
+                )
+                if own_txn:
+                    conn.commit()
+            except Exception:
+                if own_txn:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                raise
 
         tool_rows = conn.execute(
             "SELECT id, conversation_id, request_turn, timestamp FROM tool_calls "
