@@ -4358,9 +4358,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
         1. UPDATE dead_op to 'abandoned'. Use rowcount to decide whether
            this is a fresh takeover (> 0) or an idempotent re-run (== 0).
         2. DELETE scoped partial writes from segments/facts/tag_summaries/
-           tag_summary_embeddings. (Idempotent: no-ops on already-absent
-           rows. Safe to run even on the idempotent re-run path because
-           there's nothing left to delete.)
+           tag_summary_embeddings/segment_tool_outputs, then
+           operation-owned rows from segment_chunks/fact_links.
+           (Idempotent: no-ops on already-absent rows. Safe to run even on
+           the idempotent re-run path because there's nothing left to
+           delete.)
         3. UPDATE canonical_turns to NULL compacted_at / compaction_operation_id
            where compaction_operation_id = dead_op. (Also idempotent.)
         4. ONLY IF the dead_op UPDATE in step 1 matched a row, INSERT a
@@ -4397,13 +4399,32 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (now, dead_operation_id, conversation_id, lifecycle_epoch),
             )
             fresh_takeover = (cur.rowcount or 0) > 0
+            # Tables that carry their own ``conversation_id`` column and
+            # so support the (operation_id, conversation_id)
+            # double-keyed DELETE. The P3-stamped facts rows are cleaned
+            # up here alongside segments / tag_summaries /
+            # tag_summary_embeddings + the segment_tool_outputs link
+            # table that was added in M0 with a conversation_id column.
+            # Per fencing plan §6.1.
             for table in (
-                "segments", "facts", "tag_summaries", "tag_summary_embeddings",
+                "segments", "facts",
+                "tag_summaries", "tag_summary_embeddings",
+                "segment_tool_outputs",
             ):
                 conn.execute(
                     f"DELETE FROM {table} "
                     f"WHERE operation_id = ? AND conversation_id = ?",
                     (dead_operation_id, conversation_id),
+                )
+            # Tables WITHOUT ``conversation_id`` are scoped by
+            # operation_id alone. ``segment_chunks`` keys to
+            # ``segment_ref`` and ``fact_links`` keys to endpoint fact
+            # ids, so the operation_id stamp is the only cleanup join
+            # key. Per fencing plan §6.1 P1-4 fold.
+            for table in ("segment_chunks", "fact_links"):
+                conn.execute(
+                    f"DELETE FROM {table} WHERE operation_id = ?",
+                    (dead_operation_id,),
                 )
             conn.execute(
                 """UPDATE canonical_turns

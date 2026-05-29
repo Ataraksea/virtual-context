@@ -4081,7 +4081,9 @@ class PostgresStore(ContextStore):
 
         1. UPDATE dead_op → 'abandoned'. rowcount decides fresh vs idempotent.
         2. DELETE scoped partial writes from segments / facts /
-           tag_summaries / tag_summary_embeddings (idempotent no-ops on
+           tag_summaries / tag_summary_embeddings /
+           segment_tool_outputs, then operation-owned rows from
+           segment_chunks / fact_links (idempotent no-ops on
            already-absent rows).
         3. UPDATE canonical_turns: NULL out compacted_at /
            compaction_operation_id where compaction_operation_id = dead_op
@@ -4117,13 +4119,32 @@ class PostgresStore(ContextStore):
                     (now, dead_operation_id, conversation_id, lifecycle_epoch),
                 )
                 fresh_takeover = (cur.rowcount or 0) > 0
+                # Tables that carry their own ``conversation_id`` column
+                # and so support the (operation_id, conversation_id)
+                # double-keyed DELETE. The P3-stamped facts rows are
+                # cleaned up here alongside segments / tag_summaries /
+                # tag_summary_embeddings + the segment_tool_outputs link
+                # table that was added in M0 with a conversation_id
+                # column. Per fencing plan §6.1.
                 for table in (
-                    "segments", "facts", "tag_summaries", "tag_summary_embeddings",
+                    "segments", "facts",
+                    "tag_summaries", "tag_summary_embeddings",
+                    "segment_tool_outputs",
                 ):
                     conn.execute(
                         f"DELETE FROM {table} "
                         f"WHERE operation_id = %s AND conversation_id = %s",
                         (dead_operation_id, conversation_id),
+                    )
+                # Tables WITHOUT ``conversation_id`` are scoped by
+                # operation_id alone. ``segment_chunks`` keys to
+                # ``segment_ref`` and ``fact_links`` keys to endpoint
+                # fact ids, so the operation_id stamp is the only
+                # cleanup join key. Per fencing plan §6.1 P1-4 fold.
+                for table in ("segment_chunks", "fact_links"):
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE operation_id = %s",
+                        (dead_operation_id,),
                     )
                 conn.execute(
                     """UPDATE canonical_turns
