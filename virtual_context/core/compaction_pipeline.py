@@ -89,6 +89,40 @@ class CompactionPipeline:
         # scope every write to the live compaction_operation row.
         self._worker_id: str | None = worker_id
 
+    def _compaction_guard_kwargs(
+        self, operation_id: str | None, *, include_conversation_id: bool = False,
+    ) -> dict[str, object]:
+        """Return guard kwargs forming an all-or-nothing tuple.
+
+        Per fencing plan §5.6 and the storage-side
+        ``_validate_compaction_guard_kwargs`` contract, every fenced
+        write must receive either all guard kwargs as ``None`` (legacy
+        unguarded path) or all as non-``None`` (fenced path with active
+        op). Mixed partial kwargs are rejected as programming errors.
+
+        ``operation_id`` and ``self._worker_id`` are the gate: when
+        both are set we emit the full guard tuple; otherwise every
+        kwarg is ``None`` so the storage method takes the legacy path.
+
+        ``include_conversation_id`` adds the conversation kwarg for the
+        two methods whose contract carries it
+        (``store_chunk_embeddings``, ``store_fact_links``,
+        ``FactLinkChecker.check_and_link``).
+        """
+        is_guarded = operation_id is not None and self._worker_id is not None
+        kwargs: dict[str, object] = {
+            "operation_id": operation_id if is_guarded else None,
+            "owner_worker_id": self._worker_id if is_guarded else None,
+            "lifecycle_epoch": (
+                int(self._engine_state.lifecycle_epoch) if is_guarded else None
+            ),
+        }
+        if include_conversation_id:
+            kwargs["conversation_id"] = (
+                self._config.conversation_id if is_guarded else None
+            )
+        return kwargs
+
     def _load_compactable_rows(self) -> tuple[list["CanonicalTurnRow"], list["Message"]]:
         from ..types import Message
 
@@ -286,13 +320,22 @@ class CompactionPipeline:
 
     def _propagate_tool_output_links(
         self, segment_ref: str, turn_start: int, turn_end: int,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
         """Copy turn-level tool output links to the segment join table.
 
         Iterates turns in ``[turn_start, turn_end)`` and for each turn that
         has ``turn_tool_outputs`` entries, writes a corresponding
-        ``segment_tool_outputs`` row.  Non-critical — failures are silenced.
+        ``segment_tool_outputs`` row.  Non-critical -- failures are
+        silenced EXCEPT ``CompactionLeaseLost``, which must propagate
+        per fencing plan §5.6 fail-closed exception handling so the
+        compactor's outer handler can emit ``COMPACTION_WRITE_REJECTED``
+        and exit cleanly without walking the remaining phases.
         """
+        from ..types import CompactionLeaseLost
         try:
             for t in range(turn_start, turn_end):
                 refs = self._store.get_tool_outputs_for_turn(
@@ -301,7 +344,12 @@ class CompactionPipeline:
                 for ref in refs:
                     self._store.link_segment_tool_output(
                         self._config.conversation_id, segment_ref, ref,
+                        operation_id=operation_id,
+                        owner_worker_id=owner_worker_id,
+                        lifecycle_epoch=lifecycle_epoch,
                     )
+        except CompactionLeaseLost:
+            raise
         except Exception:
             pass  # non-critical
 
@@ -422,13 +470,7 @@ class CompactionPipeline:
             self._store.mark_canonical_turns_compacted(
                 self._config.conversation_id,
                 compacted_turn_ids,
-                operation_id=operation_id,
-                owner_worker_id=self._worker_id,
-                lifecycle_epoch=(
-                    int(self._engine_state.lifecycle_epoch)
-                    if operation_id is not None and self._worker_id is not None
-                    else None
-                ),
+                **self._compaction_guard_kwargs(operation_id),
             )
         if compact_rows:
             self._refresh_compaction_watermark()
@@ -597,29 +639,23 @@ class CompactionPipeline:
             self._store.save_tag_summary(
                 ts,
                 conversation_id=self._config.conversation_id,
-                operation_id=operation_id,
-                owner_worker_id=self._worker_id,
-                lifecycle_epoch=(
-                    int(self._engine_state.lifecycle_epoch)
-                    if operation_id is not None and self._worker_id is not None
-                    else None
-                ),
+                **self._compaction_guard_kwargs(operation_id),
             )
             # Compute and store tag summary embedding for RRF scoring.
             try:
+                from ..types import CompactionLeaseLost as _CLL
                 embed_fn = self._semantic.get_embed_fn() if self._semantic else None
                 if embed_fn and ts.summary:
                     emb = embed_fn([ts.summary[:2000]])[0]
                     self._store.store_tag_summary_embedding(
                         ts.tag, self._config.conversation_id, emb,
-                        operation_id=operation_id,
-                        owner_worker_id=self._worker_id,
-                        lifecycle_epoch=(
-                            int(self._engine_state.lifecycle_epoch)
-                            if operation_id is not None and self._worker_id is not None
-                            else None
-                        ),
+                        **self._compaction_guard_kwargs(operation_id),
                     )
+            except _CLL:
+                # Fail-closed: lease loss must propagate per fencing
+                # plan §5.6 so the outer wrapper can emit
+                # COMPACTION_WRITE_REJECTED.
+                raise
             except Exception as e:
                 logger.debug("Failed to embed tag summary '%s': %s", ts.tag, e)
             if progress_callback:
@@ -835,18 +871,15 @@ class CompactionPipeline:
                 )
                 self._store.store_segment(
                     stored,
-                    operation_id=operation_id,
-                    owner_worker_id=self._worker_id,
-                    lifecycle_epoch=(
-                        int(self._engine_state.lifecycle_epoch)
-                        if operation_id is not None and self._worker_id is not None
-                        else None
-                    ),
+                    **self._compaction_guard_kwargs(operation_id),
                 )
-                # Propagate turn → segment tool output links
+                # Propagate turn -> segment tool output links
                 turn_range = segment_turn_ranges.get(seg.id)
                 if turn_range:
-                    self._propagate_tool_output_links(stored.ref, *turn_range)
+                    self._propagate_tool_output_links(
+                        stored.ref, *turn_range,
+                        **self._compaction_guard_kwargs(operation_id),
+                    )
                 all_results.append(result)
                 continue
 
@@ -1014,15 +1047,14 @@ class CompactionPipeline:
                 )
                 self._store.update_segment(
                     stored,
-                    operation_id=operation_id,
-                    owner_worker_id=self._worker_id,
-                    lifecycle_epoch=(
-                        int(self._engine_state.lifecycle_epoch)
-                        if operation_id is not None and self._worker_id is not None
-                        else None
+                    **self._compaction_guard_kwargs(operation_id),
+                )
+                self._semantic.embed_and_store_chunks(
+                    stored,
+                    **self._compaction_guard_kwargs(
+                        operation_id, include_conversation_id=True,
                     ),
                 )
-                self._semantic.embed_and_store_chunks(stored)
                 result.segment_id = seg.merge_ref
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
@@ -1050,15 +1082,14 @@ class CompactionPipeline:
                 )
                 self._store.store_segment(
                     stored,
-                    operation_id=operation_id,
-                    owner_worker_id=self._worker_id,
-                    lifecycle_epoch=(
-                        int(self._engine_state.lifecycle_epoch)
-                        if operation_id is not None and self._worker_id is not None
-                        else None
+                    **self._compaction_guard_kwargs(operation_id),
+                )
+                self._semantic.embed_and_store_chunks(
+                    stored,
+                    **self._compaction_guard_kwargs(
+                        operation_id, include_conversation_id=True,
                     ),
                 )
-                self._semantic.embed_and_store_chunks(stored)
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
                     "  COMPACT NEW %d/%d: %s (session_date=%s, %dt→%dt, %d turns)",
@@ -1067,10 +1098,13 @@ class CompactionPipeline:
                     result.original_tokens, result.summary_tokens, seg.turn_count,
                 )
 
-            # Propagate turn → segment tool output links
+            # Propagate turn -> segment tool output links
             turn_range = segment_turn_ranges.get(seg.id)
             if turn_range:
-                self._propagate_tool_output_links(stored.ref, *turn_range)
+                self._propagate_tool_output_links(
+                    stored.ref, *turn_range,
+                    **self._compaction_guard_kwargs(operation_id),
+                )
 
             all_results.append(result)
             stored_done = seg_idx + 1
@@ -1092,13 +1126,7 @@ class CompactionPipeline:
                     fact.conversation_id = self._config.conversation_id
                 _deleted, _inserted = self._store.replace_facts_for_segment(
                     self._config.conversation_id, _seg_ref, result.facts,
-                    operation_id=operation_id,
-                    owner_worker_id=self._worker_id,
-                    lifecycle_epoch=(
-                        int(self._engine_state.lifecycle_epoch)
-                        if operation_id is not None and self._worker_id is not None
-                        else None
-                    ),
+                    **self._compaction_guard_kwargs(operation_id),
                 )
                 if _deleted:
                     logger.info("  Replaced %d old facts with %d new for segment %s",
@@ -1108,15 +1136,31 @@ class CompactionPipeline:
                 _superseded_count = 0
                 _links_count = 0
                 if self._supersession_checker:
+                    from ..types import CompactionLeaseLost
+                    _full_guard = self._compaction_guard_kwargs(
+                        operation_id, include_conversation_id=True,
+                    )
+                    _triple_guard = self._compaction_guard_kwargs(operation_id)
                     try:
                         if hasattr(self._supersession_checker, 'check_and_link'):
-                            _links_count, _superseded_count = self._supersession_checker.check_and_link(result.facts)
+                            _links_count, _superseded_count = self._supersession_checker.check_and_link(
+                                result.facts, **_full_guard,
+                            )
                         else:
-                            _superseded_count = self._supersession_checker.check_and_supersede(result.facts) or 0
+                            _superseded_count = self._supersession_checker.check_and_supersede(
+                                result.facts, **_triple_guard,
+                            ) or 0
                         if _superseded_count:
                             logger.info("  Superseded %d facts for segment %s", _superseded_count, result.primary_tag)
                         if _links_count:
                             logger.info("  Linked %d facts for segment %s", _links_count, result.primary_tag)
+                    except CompactionLeaseLost:
+                        # Fencing plan §5.6 fail-closed handling: the
+                        # outer compaction wrapper catches this and
+                        # emits COMPACTION_WRITE_REJECTED, exiting the
+                        # operation cleanly without walking the rest
+                        # of the phases.
+                        raise
                     except Exception as e:
                         logger.warning("Supersession/linking failed: %s", e)
                 _emit_progress(

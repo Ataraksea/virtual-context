@@ -146,7 +146,24 @@ class SemanticSearchManager:
                     self._embed_fn = None
         return self._embed_fn
 
-    def embed_and_store_chunks(self, stored: StoredSegment) -> None:
+    def embed_and_store_chunks(
+        self,
+        stored: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
+        """Compute and store chunk embeddings for a segment.
+
+        When called from a compaction phase, the caller forwards the
+        guard kwargs so ``store_chunk_embeddings`` writes through the
+        active operation-id fence (fencing plan §5.6 caller-side
+        propagation). Legacy non-compaction callers (the lazy backfill
+        path at line ~409 below) omit the kwargs and continue through
+        the documented all-None branch.
+        """
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return
@@ -167,7 +184,13 @@ class SemanticSearchManager:
             )
             for i, (text, vec) in enumerate(zip(chunks, vectors))
         ]
-        self._store.store_chunk_embeddings(stored.ref, chunk_embeddings)
+        self._store.store_chunk_embeddings(
+            stored.ref, chunk_embeddings,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
         logger.debug("Stored %d chunk embeddings for segment %s", len(chunk_embeddings), stored.ref)
 
     def embed_and_store_turn(
