@@ -504,13 +504,40 @@ class CompositeStore:
     def search_facts(self, query: str, limit: int = 10, conversation_id: str | None = None) -> list[Fact]:
         return self._facts.search_facts(query, limit=limit, conversation_id=conversation_id)
 
-    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
-        return self._facts.set_fact_superseded(old_fact_id, new_fact_id)
+    def set_fact_superseded(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        return self._facts.set_fact_superseded(
+            old_fact_id, new_fact_id,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def update_fact_fields(
-        self, fact_id: str, verb: str, object: str, status: str, what: str,
+        self,
+        fact_id: str,
+        verb: str,
+        object: str,
+        status: str,
+        what: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
-        return self._facts.update_fact_fields(fact_id, verb, object, status, what)
+        return self._facts.update_fact_fields(
+            fact_id, verb, object, status, what,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def get_fact_count_by_tags(self, *, conversation_id: str | None = None) -> dict[str, int]:
         return self._facts.get_fact_count_by_tags(conversation_id=conversation_id)
@@ -536,8 +563,22 @@ class CompositeStore:
     # FactLinkStore
     # ------------------------------------------------------------------
 
-    def store_fact_links(self, links: list[FactLink]) -> int:
-        return self._fact_links.store_fact_links(links)
+    def store_fact_links(
+        self,
+        links: list[FactLink],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
+        return self._fact_links.store_fact_links(
+            links,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
 
     def get_fact_links(self, fact_id: str, direction: str = "both") -> list[FactLink]:
         return self._fact_links.get_fact_links(fact_id, direction=direction)
@@ -616,9 +657,22 @@ class CompositeStore:
         return self._search.search_canonical_turn_text(*args, **kwargs)
 
     def store_chunk_embeddings(
-        self, segment_ref: str, chunks: list[ChunkEmbedding],
+        self,
+        segment_ref: str,
+        chunks: list[ChunkEmbedding],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
     ) -> None:
-        return self._search.store_chunk_embeddings(segment_ref, chunks)
+        return self._search.store_chunk_embeddings(
+            segment_ref, chunks,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return self._search.get_all_chunk_embeddings()
@@ -1264,8 +1318,22 @@ class CompositeStore:
     def get_tool_outputs_for_turn(self, conversation_id: str, turn_number: int) -> list[str]:
         return self._search.get_tool_outputs_for_turn(conversation_id, turn_number)
 
-    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
-        return self._search.link_segment_tool_output(conversation_id, segment_ref, tool_output_ref)
+    def link_segment_tool_output(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        tool_output_ref: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
+        return self._search.link_segment_tool_output(
+            conversation_id, segment_ref, tool_output_ref,
+            operation_id=operation_id,
+            owner_worker_id=owner_worker_id,
+            lifecycle_epoch=lifecycle_epoch,
+        )
 
     def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
         return self._search.get_tool_outputs_for_segment(conversation_id, segment_ref)

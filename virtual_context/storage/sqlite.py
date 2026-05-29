@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS segment_chunks (
     chunk_index INTEGER NOT NULL,
     text TEXT NOT NULL,
     embedding_json TEXT NOT NULL,
+    operation_id TEXT NULL,
     PRIMARY KEY (segment_ref, chunk_index)
 );
 
@@ -1201,6 +1202,7 @@ class SQLiteStore(ContextStore):
                 context TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT '',
                 created_by TEXT NOT NULL DEFAULT 'compaction',
+                operation_id TEXT NULL,
                 FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE CASCADE,
                 FOREIGN KEY (target_fact_id) REFERENCES facts(id) ON DELETE CASCADE
             );
@@ -1208,6 +1210,10 @@ class SQLiteStore(ContextStore):
             CREATE INDEX IF NOT EXISTS idx_fact_links_target ON fact_links(target_fact_id);
             CREATE INDEX IF NOT EXISTS idx_fact_links_type ON fact_links(relation_type);
         """)
+        # M0 operation_id indexes are declared inside
+        # _ensure_compaction_scoping_columns, after the ALTER TABLE that adds
+        # operation_id to upgraded databases. Declaring them here would fail
+        # on existing stores whose tables predate the column.
         # D1: migrate — add fact_type column to existing facts tables
         try:
             conn.execute("SELECT fact_type FROM facts LIMIT 1")
@@ -1437,6 +1443,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 conversation_id TEXT NOT NULL,
                 segment_ref TEXT NOT NULL,
                 tool_output_ref TEXT NOT NULL,
+                operation_id TEXT NULL,
                 PRIMARY KEY (conversation_id, segment_ref, tool_output_ref)
             );
         """)
@@ -1714,6 +1721,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
             ("tag_summaries", "operation_id", "TEXT"),
             ("tag_summary_embeddings", "operation_id", "TEXT"),
             ("canonical_turns", "compaction_operation_id", "TEXT"),
+            # Compaction-fence M0 tables. Operation-id linkage lets
+            # cleanup_abandoned_compaction scope-delete pure-insert
+            # writes on these tables; without it the rows would persist
+            # after the owning operation is abandoned.
+            ("segment_chunks", "operation_id", "TEXT"),
+            ("segment_tool_outputs", "operation_id", "TEXT"),
+            ("fact_links", "operation_id", "TEXT"),
         ):
             self._add_column_if_missing(conn, table, column, definition)
             # Backfill pre-migration rows to the zero-UUID sentinel.
@@ -1723,6 +1737,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 f"UPDATE {table} SET {column} = ? WHERE {column} IS NULL",
                 (zero_uuid,),
             )
+        # M0.2 fence indexes for cleanup DELETE efficiency. CREATE INDEX
+        # IF NOT EXISTS is idempotent.
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_segment_chunks_operation_id "
+            "ON segment_chunks(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_segment_tool_outputs_operation_id "
+            "ON segment_tool_outputs(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_fact_links_operation_id "
+            "ON fact_links(operation_id)",
+            "CREATE INDEX IF NOT EXISTS idx_facts_operation_id "
+            "ON facts(operation_id)",
+        ):
+            try:
+                conn.execute(stmt)
+            except Exception:
+                pass
 
     def _lookup_canonical_turn_id_for_ordinal(self, conversation_id: str, turn_number: int) -> str | None:
         conn = self._get_conn()
@@ -4887,7 +4917,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
             results.append(_row_to_segment(row, tags_map[row["ref"]]))
         return results
 
-    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+    def store_chunk_embeddings(
+        self,
+        segment_ref: str,
+        chunks: list[ChunkEmbedding],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -6458,7 +6497,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
             rows = conn.execute(sql, params).fetchall()
             return [self._row_to_fact_with_session_date(row) for row in rows]
 
-    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
+    def set_fact_superseded(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         conn = self._get_conn()
         conn.execute(
             "UPDATE facts SET superseded_by = ? WHERE id = ?",
@@ -6467,7 +6514,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn.commit()
 
     def update_fact_fields(
-        self, fact_id: str, verb: str, object: str, status: str, what: str
+        self,
+        fact_id: str,
+        verb: str,
+        object: str,
+        status: str,
+        what: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
         conn = self._get_conn()
         conn.execute(
@@ -6516,7 +6572,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # Fact links
     # ------------------------------------------------------------------
 
-    def store_fact_links(self, links: list[FactLink]) -> int:
+    def store_fact_links(
+        self,
+        links: list[FactLink],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
         if not links:
             return 0
         conn = self._get_conn()
@@ -6833,7 +6897,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
         ).fetchall()
         return [row["tool_output_ref"] for row in rows]
 
-    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+    def link_segment_tool_output(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        tool_output_ref: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         conn = self._get_conn()
         conn.execute(
             """INSERT OR IGNORE INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)

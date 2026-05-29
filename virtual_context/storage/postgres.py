@@ -205,6 +205,7 @@ CREATE TABLE IF NOT EXISTS segment_chunks (
     chunk_index INTEGER NOT NULL,
     text TEXT NOT NULL,
     embedding_json TEXT NOT NULL,
+    operation_id UUID NULL,
     PRIMARY KEY (segment_ref, chunk_index)
 );
 
@@ -255,6 +256,7 @@ CREATE TABLE IF NOT EXISTS fact_links (
     context TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT '',
     created_by TEXT NOT NULL DEFAULT 'compaction',
+    operation_id UUID NULL,
     FOREIGN KEY (source_fact_id) REFERENCES facts(id) ON DELETE CASCADE,
     FOREIGN KEY (target_fact_id) REFERENCES facts(id) ON DELETE CASCADE
 );
@@ -348,6 +350,10 @@ CREATE INDEX IF NOT EXISTS idx_fact_tags_tag ON fact_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_fact_links_source ON fact_links(source_fact_id);
 CREATE INDEX IF NOT EXISTS idx_fact_links_target ON fact_links(target_fact_id);
 CREATE INDEX IF NOT EXISTS idx_fact_links_type ON fact_links(relation_type);
+-- M0.2 fence indexes are issued through `_ensure_compaction_fence_schema`
+-- using CREATE INDEX CONCURRENTLY outside the broad SCHEMA_SQL split
+-- loop so a failed required index does not silently slip through the
+-- loop's except/pass swallow.
 
 CREATE TABLE IF NOT EXISTS turn_tool_outputs (
     conversation_id TEXT NOT NULL,
@@ -360,6 +366,7 @@ CREATE TABLE IF NOT EXISTS segment_tool_outputs (
     conversation_id TEXT NOT NULL,
     segment_ref TEXT NOT NULL,
     tool_output_ref TEXT NOT NULL,
+    operation_id UUID NULL,
     PRIMARY KEY (conversation_id, segment_ref, tool_output_ref)
 );
 
@@ -1331,6 +1338,12 @@ class PostgresStore(ContextStore):
             self._ensure_canonical_turn_views()
         except Exception:
             logger.warning("canonical turn bootstrap failed", exc_info=True)
+        # Required fence DDL runs outside the broad canonical-turn
+        # try/catch so a real failure (permission, type, persistent
+        # lock timeout) blocks startup. M0 cleanup DELETEs depend on
+        # these columns and indexes existing; a silent skip would
+        # leave the fence build in an unsafe state.
+        self._ensure_compaction_fence_schema()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -1479,6 +1492,112 @@ class PostgresStore(ContextStore):
                 )
             except Exception:
                 pass
+
+    def _ensure_compaction_fence_schema(self) -> None:
+        """Add operation_id linkage to compaction-write tables that were
+        previously unfenced. Dedicated required migration handler outside
+        the broad best-effort ``SCHEMA_SQL`` split loop so real DDL
+        failures surface rather than being silently swallowed.
+
+        ALTERs run inside an explicit transaction with a SET LOCAL
+        ``lock_timeout`` so the lock-acquisition window for the brief
+        ``ACCESS EXCLUSIVE`` lock is bounded. SET LOCAL is
+        transaction-scoped; running it under autocommit would not
+        govern the following statements. A bounded retry catches the
+        rare case where the ALTER loses the lock race against a busy
+        writer.
+
+        Duplicate-column outcomes are benign re-runs and are squelched.
+        Any other failure (permission, type, syntax, persistent lock
+        timeout after retries) is raised so the caller can fail
+        startup before the fence build runs without the required
+        columns.
+
+        ``CREATE INDEX CONCURRENTLY`` cannot run inside a transaction
+        block, so the indexes run on a dedicated autocommit connection.
+        ``IF NOT EXISTS`` will skip the create if a prior interrupted
+        run left an invalid relation behind; the helper detects an
+        invalid ``pg_index`` entry, drops it, and recreates so a
+        crashed mid-migration can self-heal on the next bootstrap.
+        """
+        zero_uuid = "00000000-0000-0000-0000-000000000000"
+        fence_tables = (
+            ("segment_chunks", "operation_id"),
+            ("segment_tool_outputs", "operation_id"),
+            ("fact_links", "operation_id"),
+        )
+
+        # ALTERs + backfills under explicit transaction so SET LOCAL
+        # lock_timeout actually governs the ALTER statements. Bounded
+        # retry handles transient lock-timeout against a busy writer.
+        max_attempts = 3
+        last_error: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with self.pool.connection() as conn:
+                    with conn.transaction():
+                        conn.execute("SET LOCAL lock_timeout = '2s'")
+                        for table, column in fence_tables:
+                            try:
+                                conn.execute(
+                                    f"ALTER TABLE {table} "
+                                    f"ADD COLUMN IF NOT EXISTS {column} UUID"
+                                )
+                            except psycopg.errors.DuplicateColumn:
+                                pass
+                        for table, column in fence_tables:
+                            conn.execute(
+                                f"UPDATE {table} SET {column} = %s "
+                                f"WHERE {column} IS NULL",
+                                (zero_uuid,),
+                            )
+                last_error = None
+                break
+            except psycopg.errors.LockNotAvailable as e:
+                last_error = e
+                logger.warning(
+                    "fence-schema ALTER lock_timeout (attempt %d/%d)",
+                    attempt, max_attempts,
+                )
+                continue
+        if last_error is not None:
+            raise RuntimeError(
+                "compaction fence ALTER could not acquire lock after "
+                f"{max_attempts} attempts"
+            ) from last_error
+
+        # Indexes under a dedicated autocommit connection so
+        # CREATE INDEX CONCURRENTLY is not rejected by the implicit
+        # transaction. Each index is preceded by an invalid-relation
+        # check so an interrupted prior run self-heals.
+        index_specs = (
+            ("idx_segment_chunks_operation_id", "segment_chunks"),
+            ("idx_segment_tool_outputs_operation_id", "segment_tool_outputs"),
+            ("idx_fact_links_operation_id", "fact_links"),
+            ("idx_facts_operation_id", "facts"),
+        )
+        with self.pool.connection() as conn:
+            conn.autocommit = True
+            for index_name, table in index_specs:
+                # Drop a known-invalid leftover from an interrupted
+                # CREATE INDEX CONCURRENTLY before re-running so
+                # ``IF NOT EXISTS`` does not skip a needed rebuild.
+                invalid_row = conn.execute(
+                    """
+                    SELECT 1 FROM pg_class c
+                      JOIN pg_index i ON i.indexrelid = c.oid
+                     WHERE c.relname = %s AND i.indisvalid IS FALSE
+                    """,
+                    (index_name,),
+                ).fetchone()
+                if invalid_row is not None:
+                    conn.execute(
+                        f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}"
+                    )
+                conn.execute(
+                    f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
+                    f"ON {table}(operation_id)"
+                )
 
     def _get_tags_for_ref(self, ref: str) -> list[str]:
         with self.pool.connection() as conn:
@@ -4550,7 +4669,16 @@ class PostgresStore(ContextStore):
                 ))
             return results
 
-    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+    def store_chunk_embeddings(
+        self,
+        segment_ref: str,
+        chunks: list[ChunkEmbedding],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
         with self.pool.connection() as conn:
             with conn.transaction():
                 conn.execute("DELETE FROM segment_chunks WHERE segment_ref = %s", (segment_ref,))
@@ -4728,7 +4856,16 @@ class PostgresStore(ContextStore):
             ).fetchall()
             return [row["tool_output_ref"] for row in rows]
 
-    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+    def link_segment_tool_output(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        tool_output_ref: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         with self.pool.connection() as conn:
             conn.execute(
                 """INSERT INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
@@ -6411,11 +6548,30 @@ class PostgresStore(ContextStore):
                 rows = conn.execute(sql, params).fetchall()
             return [self._row_to_fact(row) for row in rows]
 
-    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
+    def set_fact_superseded(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         with self.pool.connection() as conn:
             conn.execute("UPDATE facts SET superseded_by = %s WHERE id = %s", (new_fact_id, old_fact_id))
 
-    def update_fact_fields(self, fact_id: str, verb: str, object: str, status: str, what: str) -> None:
+    def update_fact_fields(
+        self,
+        fact_id: str,
+        verb: str,
+        object: str,
+        status: str,
+        what: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         with self.pool.connection() as conn:
             conn.execute(
                 "UPDATE facts SET verb = %s, object = %s, status = %s, what = %s WHERE id = %s",
@@ -6466,7 +6622,15 @@ class PostgresStore(ContextStore):
     # FactLinkStore
     # ------------------------------------------------------------------
 
-    def store_fact_links(self, links: list[FactLink]) -> int:
+    def store_fact_links(
+        self,
+        links: list[FactLink],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> int:
         if not links:
             return 0
         with self.pool.connection() as conn:

@@ -14,7 +14,14 @@ class ContextStore(ABC):
     """Pluggable storage backend for compacted conversation segments."""
 
     @abstractmethod
-    def store_segment(self, segment: StoredSegment) -> str:
+    def store_segment(
+        self,
+        segment: StoredSegment,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> str:
         """Upsert by ref. Returns ref."""
 
     def update_segment(
@@ -204,7 +211,16 @@ class ContextStore(ABC):
         conversation_id: str | None = None,
     ) -> list[StoredSegment]: ...
 
-    def store_chunk_embeddings(self, segment_ref: str, chunks: list[ChunkEmbedding]) -> None:
+    def store_chunk_embeddings(
+        self,
+        segment_ref: str,
+        chunks: list[ChunkEmbedding],
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+        conversation_id: str | None = None,
+    ) -> None:
         """Idempotent: replaces any existing chunks for this segment."""
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
@@ -924,11 +940,28 @@ class ContextStore(ABC):
         """FTS search across fact fields. Returns non-superseded facts."""
         return []
 
-    def set_fact_superseded(self, old_fact_id: str, new_fact_id: str) -> None:
+    def set_fact_superseded(
+        self,
+        old_fact_id: str,
+        new_fact_id: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         pass
 
     def update_fact_fields(
-        self, fact_id: str, verb: str, object: str, status: str, what: str
+        self,
+        fact_id: str,
+        verb: str,
+        object: str,
+        status: str,
+        what: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
     ) -> None:
         pass
 
@@ -968,7 +1001,16 @@ class ContextStore(ABC):
         """Return tool_output refs linked to a turn."""
         return []
 
-    def link_segment_tool_output(self, conversation_id: str, segment_ref: str, tool_output_ref: str) -> None:
+    def link_segment_tool_output(
+        self,
+        conversation_id: str,
+        segment_ref: str,
+        tool_output_ref: str,
+        *,
+        operation_id: str | None = None,
+        owner_worker_id: str | None = None,
+        lifecycle_epoch: int | None = None,
+    ) -> None:
         """Link a tool output ref to a segment."""
         pass
 
