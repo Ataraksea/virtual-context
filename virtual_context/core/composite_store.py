@@ -881,6 +881,7 @@ class CompositeStore:
         conversation_id: str,
         lifecycle_epoch: int,
         worker_id: str,
+        expected_operation_id: str | None = None,
     ) -> str | None:
         fn = getattr(self._segments, "drain_compaction_exit", None)
         if callable(fn):
@@ -888,6 +889,7 @@ class CompositeStore:
                 conversation_id=conversation_id,
                 lifecycle_epoch=lifecycle_epoch,
                 worker_id=worker_id,
+                expected_operation_id=expected_operation_id,
             )
         raise NotImplementedError
 

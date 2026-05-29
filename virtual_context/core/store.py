@@ -797,25 +797,30 @@ class ContextStore(ABC):
         conversation_id: str,
         lifecycle_epoch: int,
         worker_id: str,
+        expected_operation_id: str | None = None,
     ) -> str | None:
         """Atomic compaction-exit decision + pending drain.
 
         Inside a single transaction:
 
-        1. Verify ``conversations.lifecycle_epoch`` matches the caller's —
+        1. Lock the ``conversation_lifecycle`` row for this conversation.
+        2. Reject any active queued/running successor at the same epoch.
+           When ``expected_operation_id`` is supplied, also verify the
+           caller's terminal ``compaction_operation`` row.
+        3. Verify ``conversations.lifecycle_epoch`` matches the caller's;
            return ``None`` on mismatch (no writes).
-        2. ``EXISTS (SELECT 1 FROM canonical_turns WHERE conversation_id = ?
+        4. ``EXISTS (SELECT 1 FROM canonical_turns WHERE conversation_id = ?
            AND tagged_at IS NULL)`` inside the same transaction.
-        3. If any untagged canonical rows remain → transition phase to
+        5. If any untagged canonical rows remain, transition phase to
            ``'ingesting'``, zero ``pending_raw_payload_entries``, and INSERT
            a fresh ``ingestion_episode`` row in ``'running'`` status whose
            ``raw_payload_entries`` equals the drained ``pending_raw``.
-           Else → transition phase to ``'active'`` and zero
-           ``pending_raw_payload_entries``.
+           Else, transition phase to ``'active'`` and zero
+           ``pending_raw_payload_entries``. When fenced, the phase UPDATE
+           is also gated on the current phase still being ``'compacting'``.
 
         Returns the new phase (``'ingesting'`` or ``'active'``) on success,
-        or ``None`` when the caller's ``lifecycle_epoch`` does not match the
-        authoritative conversations row. Epoch-guarded.
+        or ``None`` on guard failure. Epoch-guarded.
 
         Callers (e.g. ``ProxyState.exit_compaction``) must NOT rely on
         ``read_progress_snapshot`` for this decision — the EXISTS check

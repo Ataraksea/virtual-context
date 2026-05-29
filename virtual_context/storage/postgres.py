@@ -4397,28 +4397,99 @@ class PostgresStore(ContextStore):
         conversation_id: str,
         lifecycle_epoch: int,
         worker_id: str,
+        expected_operation_id: str | None = None,
     ) -> str | None:
-        """Atomic compaction-exit decision + pending drain.
+        """Atomic compaction-exit decision + pending drain, operation-id fenced.
 
-        Postgres mirror of the SQLite helper. Wraps the epoch check, the
-        ``EXISTS`` probe against ``canonical_turns``, the phase UPDATE, and
-        (on untagged-exists) a fresh ``ingestion_episode`` INSERT in a
-        single ``conn.transaction()`` so a concurrent tagger cannot flip
-        the answer between read and write.
+        Postgres mirror of the SQLite helper. Wraps the lifecycle lock,
+        the terminal-op + no-active-successor guards, the
+        ``conversations.phase`` UPDATE, and (on untagged-exists) a fresh
+        ``ingestion_episode`` INSERT in a single ``conn.transaction()``
+        so a concurrent begin_compaction_with_lock cannot insert an
+        active op between the predicate checks and the phase write.
 
-        Returns ``'ingesting'`` (work remains — episode row inserted) or
-        ``'active'`` (all canonical rows tagged) on success, or ``None``
-        when the caller's ``lifecycle_epoch`` does not match the
-        authoritative conversations row. Epoch-guarded.
+        The no-active-successor guard rejects any row at ``status IN
+        ('queued','running')`` for the same
+        ``(conversation_id, lifecycle_epoch)``. When
+        ``expected_operation_id`` is supplied, the drain also requires a
+        terminal ``compaction_operation`` row for the caller's
+        ``(operation_id, owner_worker_id, lifecycle_epoch)``. A loser
+        worker whose ``expected_operation_id`` is the caller's own
+        (non-owned) op observes the mismatch and skips the phase advance.
+
+        Returns ``'ingesting'`` (work remains; episode row inserted) or
+        ``'active'`` (all canonical rows tagged) on success, or
+        ``None`` on any guard failure (epoch mismatch, missing
+        terminal op for the caller, active successor present, missing
+        lifecycle row, or fenced phase no longer ``'compacting'``).
         """
         import uuid
 
         now = datetime.now(timezone.utc)
         with self.pool.connection() as conn:
             with conn.transaction():
+                # Lifecycle-first lock so the no-active-successor guard
+                # is sound against a concurrent begin_compaction_with_lock
+                # / cleanup_abandoned_compaction insert.
+                lock_row = conn.execute(
+                    "SELECT 1 FROM conversation_lifecycle "
+                    "WHERE conversation_id = %s "
+                    "FOR UPDATE",
+                    (conversation_id,),
+                ).fetchone()
+                if lock_row is None:
+                    return None
+
+                # When the caller supplied expected_operation_id, gate
+                # the drain on a terminal row owned by this worker. The
+                # caller's complete_compaction_operation /
+                # fail_compaction_operation must already have run, so
+                # the row exists with status IN
+                # ('completed', 'failed', 'abandoned', 'cancelled').
+                if expected_operation_id is not None:
+                    terminal_row = conn.execute(
+                        """
+                        SELECT 1
+                          FROM compaction_operation
+                         WHERE conversation_id = %s
+                           AND operation_id = %s
+                           AND owner_worker_id = %s
+                           AND lifecycle_epoch = %s
+                           AND status IN (
+                               'completed', 'failed',
+                               'abandoned', 'cancelled'
+                           )
+                        """,
+                        (
+                            conversation_id, expected_operation_id,
+                            worker_id, lifecycle_epoch,
+                        ),
+                    ).fetchone()
+                    if terminal_row is None:
+                        return None
+
+                # No-active-successor guard: any row at status
+                # ('queued','running') for this (conv, epoch) blocks
+                # the drain. The caller's expected_operation_id is
+                # already terminal so it cannot be the self-blocker.
+                successor_row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM compaction_operation
+                     WHERE conversation_id = %s
+                       AND lifecycle_epoch = %s
+                       AND status IN ('queued', 'running')
+                     LIMIT 1
+                    """,
+                    (conversation_id, lifecycle_epoch),
+                ).fetchone()
+                if successor_row is not None:
+                    return None
+
                 row = conn.execute(
                     """
                     SELECT pending_raw_payload_entries, lifecycle_epoch,
+                           phase,
                            EXISTS (
                              SELECT 1 FROM canonical_turns
                               WHERE conversation_id = %s AND tagged_at IS NULL
@@ -4433,6 +4504,7 @@ class PostgresStore(ContextStore):
                 if isinstance(row, dict):
                     current_epoch = int(row["lifecycle_epoch"])
                     pending_raw = int(row["pending_raw_payload_entries"])
+                    current_phase = str(row["phase"])
                     # When psycopg row factory returns dict rows, the
                     # unnamed EXISTS expression is keyed by its auto-generated
                     # alias "exists".
@@ -4440,21 +4512,45 @@ class PostgresStore(ContextStore):
                 else:
                     pending_raw = int(row[0])
                     current_epoch = int(row[1])
-                    has_untagged = bool(row[2])
+                    current_phase = str(row[2])
+                    has_untagged = bool(row[3])
                 if current_epoch != lifecycle_epoch:
                     return None
+                # Phase must still be 'compacting'; if a peer already
+                # drained or a concurrent delete flipped phase, skip.
+                if (
+                    expected_operation_id is not None
+                    and current_phase != "compacting"
+                ):
+                    return None
                 if has_untagged:
-                    conn.execute(
-                        """
-                        UPDATE conversations
-                           SET phase = 'ingesting',
-                               pending_raw_payload_entries = 0,
-                               updated_at = %s
-                         WHERE conversation_id = %s
-                           AND lifecycle_epoch = %s
-                        """,
-                        (now, conversation_id, lifecycle_epoch),
-                    )
+                    if expected_operation_id is not None:
+                        cur = conn.execute(
+                            """
+                            UPDATE conversations
+                               SET phase = 'ingesting',
+                                   pending_raw_payload_entries = 0,
+                                   updated_at = %s
+                             WHERE conversation_id = %s
+                               AND lifecycle_epoch = %s
+                               AND phase = 'compacting'
+                            """,
+                            (now, conversation_id, lifecycle_epoch),
+                        )
+                        if cur.rowcount != 1:
+                            return None
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE conversations
+                               SET phase = 'ingesting',
+                                   pending_raw_payload_entries = 0,
+                                   updated_at = %s
+                             WHERE conversation_id = %s
+                               AND lifecycle_epoch = %s
+                            """,
+                            (now, conversation_id, lifecycle_epoch),
+                        )
                     conn.execute(
                         """
                         INSERT INTO ingestion_episode (
@@ -4469,17 +4565,33 @@ class PostgresStore(ContextStore):
                         ),
                     )
                     return "ingesting"
-                conn.execute(
-                    """
-                    UPDATE conversations
-                       SET phase = 'active',
-                           pending_raw_payload_entries = 0,
-                           updated_at = %s
-                     WHERE conversation_id = %s
-                       AND lifecycle_epoch = %s
-                    """,
-                    (now, conversation_id, lifecycle_epoch),
-                )
+                if expected_operation_id is not None:
+                    cur = conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'active',
+                               pending_raw_payload_entries = 0,
+                               updated_at = %s
+                         WHERE conversation_id = %s
+                           AND lifecycle_epoch = %s
+                           AND phase = 'compacting'
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
+                    if cur.rowcount != 1:
+                        return None
+                else:
+                    conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'active',
+                               pending_raw_payload_entries = 0,
+                               updated_at = %s
+                         WHERE conversation_id = %s
+                           AND lifecycle_epoch = %s
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
                 return "active"
 
     def delete_conversation(self, conversation_id: str) -> int:

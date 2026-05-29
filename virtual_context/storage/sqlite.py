@@ -4679,21 +4679,34 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id: str,
         lifecycle_epoch: int,
         worker_id: str,
+        expected_operation_id: str | None = None,
     ) -> str | None:
-        """Atomic compaction-exit decision + pending drain.
+        """Atomic compaction-exit decision + pending drain, operation-id fenced.
 
-        Single ``BEGIN IMMEDIATE`` transaction containing: epoch check,
+        Single ``BEGIN IMMEDIATE`` transaction containing: lifecycle
+        lock probe, optional terminal-op + no-active-successor guards,
         ``EXISTS (SELECT 1 FROM canonical_turns WHERE tagged_at IS NULL)``,
         phase UPDATE with pending drain, and (on untagged-exists) a fresh
-        ``ingestion_episode`` INSERT seeded with the drained ``pending_raw``
-        value. Serialising the read and write in one transaction closes
-        the race where a concurrent tagger marks the last row tagged
-        between a separate snapshot read and the phase UPDATE.
+        ``ingestion_episode`` INSERT seeded with the drained
+        ``pending_raw`` value. Serialising the read and write in one
+        transaction closes the race where a concurrent tagger marks
+        the last row tagged between a separate snapshot read and the
+        phase UPDATE, AND the no-active-successor race against a
+        concurrent ``begin_compaction_with_lock``.
 
-        Returns ``'ingesting'`` (work remains — episode row inserted) or
-        ``'active'`` (all canonical rows tagged) on success, or ``None``
-        when the caller's ``lifecycle_epoch`` does not match the
-        authoritative conversations row. Epoch-guarded.
+        The no-active-successor guard rejects any row at ``status IN
+        ('queued','running')`` for the same
+        ``(conversation_id, lifecycle_epoch)``. When
+        ``expected_operation_id`` is supplied, the drain also requires a
+        terminal ``compaction_operation`` row for the caller's
+        ``(operation_id, owner_worker_id, lifecycle_epoch)``. A loser
+        worker whose ``expected_operation_id`` is the caller's own
+        (non-owned) op observes the mismatch and skips the phase advance.
+
+        Returns ``'ingesting'`` / ``'active'`` on success, or ``None``
+        on any guard failure (epoch mismatch, missing lifecycle row,
+        missing terminal op, active successor present, or fenced phase
+        no longer ``'compacting'``).
         """
         import uuid
 
@@ -4701,9 +4714,57 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
+            lock_row = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if lock_row is None:
+                conn.rollback()
+                return None
+
+            if expected_operation_id is not None:
+                terminal_row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM compaction_operation
+                     WHERE conversation_id = ?
+                       AND operation_id = ?
+                       AND owner_worker_id = ?
+                       AND lifecycle_epoch = ?
+                       AND status IN (
+                           'completed', 'failed',
+                           'abandoned', 'cancelled'
+                       )
+                    """,
+                    (
+                        conversation_id, expected_operation_id,
+                        worker_id, lifecycle_epoch,
+                    ),
+                ).fetchone()
+                if terminal_row is None:
+                    conn.rollback()
+                    return None
+
+            successor_row = conn.execute(
+                """
+                SELECT 1
+                  FROM compaction_operation
+                 WHERE conversation_id = ?
+                   AND lifecycle_epoch = ?
+                   AND status IN ('queued', 'running')
+                 LIMIT 1
+                """,
+                (conversation_id, lifecycle_epoch),
+            ).fetchone()
+            if successor_row is not None:
+                conn.rollback()
+                return None
+
             row = conn.execute(
                 """
                 SELECT pending_raw_payload_entries, lifecycle_epoch,
+                       phase,
                        EXISTS (
                          SELECT 1 FROM canonical_turns
                           WHERE conversation_id = ? AND tagged_at IS NULL
@@ -4717,19 +4778,43 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 conn.rollback()
                 return None
             pending_raw = int(row[0])
-            has_untagged = bool(row[2])
+            current_phase = str(row[2])
+            has_untagged = bool(row[3])
+            if (
+                expected_operation_id is not None
+                and current_phase != "compacting"
+            ):
+                conn.rollback()
+                return None
             if has_untagged:
-                conn.execute(
-                    """
-                    UPDATE conversations
-                       SET phase = 'ingesting',
-                           pending_raw_payload_entries = 0,
-                           updated_at = ?
-                     WHERE conversation_id = ?
-                       AND lifecycle_epoch = ?
-                    """,
-                    (now, conversation_id, lifecycle_epoch),
-                )
+                if expected_operation_id is not None:
+                    cur = conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'ingesting',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                           AND phase = 'compacting'
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        return None
+                else:
+                    conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'ingesting',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
                 conn.execute(
                     """
                     INSERT INTO ingestion_episode (
@@ -4745,17 +4830,34 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 )
                 new_phase = "ingesting"
             else:
-                conn.execute(
-                    """
-                    UPDATE conversations
-                       SET phase = 'active',
-                           pending_raw_payload_entries = 0,
-                           updated_at = ?
-                     WHERE conversation_id = ?
-                       AND lifecycle_epoch = ?
-                    """,
-                    (now, conversation_id, lifecycle_epoch),
-                )
+                if expected_operation_id is not None:
+                    cur = conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'active',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                           AND phase = 'compacting'
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
+                    if cur.rowcount != 1:
+                        conn.rollback()
+                        return None
+                else:
+                    conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'active',
+                               pending_raw_payload_entries = 0,
+                               updated_at = ?
+                         WHERE conversation_id = ?
+                           AND lifecycle_epoch = ?
+                        """,
+                        (now, conversation_id, lifecycle_epoch),
+                    )
                 new_phase = "active"
             conn.commit()
             return new_phase

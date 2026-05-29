@@ -1045,10 +1045,21 @@ class ProxyState:
         # transaction as the phase UPDATE via a direct EXISTS check on
         # canonical_turns.tagged_at, so a concurrent tagger cannot flip
         # the answer between read and write.
+        #
+        # Per the fencing plan §3.3 caller-side discipline: when
+        # ``active`` from the pre-snapshot is None, this worker does
+        # not own a running op (e.g. a loser observed someone else's
+        # row earlier). Skip the drain entirely so we cannot
+        # terminalize a phase that belongs to another worker. When the
+        # snapshot did surface an op, pass its operation_id to the
+        # drain as the ownership guard.
+        if active is None:
+            return
         new_phase = self.engine._store.drain_compaction_exit(
             conversation_id=conv,
             lifecycle_epoch=epoch,
             worker_id=self._worker_id,
+            expected_operation_id=active.operation_id,
         )
         if new_phase in ("ingesting", "active"):
             self._publish_phase_transition("compacting", new_phase)
