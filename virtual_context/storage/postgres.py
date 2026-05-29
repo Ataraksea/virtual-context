@@ -3792,6 +3792,136 @@ class PostgresStore(ContextStore):
     # stale thread whose conversation was resurrected to a newer epoch
     # is rejected at SQL level.
 
+    def begin_compaction_with_lock(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        new_operation_id: str,
+        phase_count: int,
+        phase_name: str = "starting",
+        required_phase: str | None = None,
+        pre_begin_check=None,
+    ) -> bool:
+        """Lifecycle-locked compaction begin: phase CAS + active op insert.
+
+        The lifecycle row's FOR UPDATE SKIP LOCKED lock serializes every
+        active-operation insertion through one site. The phase CAS and
+        the compaction_operation INSERT live inside the same transaction
+        so a successor cannot slip an active op between the predicate
+        checks and the write that the drain side guards against.
+
+        Returns True iff the active op was inserted by this call. Returns
+        False on any of:
+          (a) lifecycle row missing or held by another transaction
+              (SKIP LOCKED).
+          (b) conversation deleted or phase not eligible for the begin.
+              When ``required_phase`` is None the phase must be one of
+              ``'active'``, ``'ingesting'``; when set, the phase must
+              equal that value exactly.
+          (c) lifecycle_epoch mismatch.
+          (d) caller-supplied ``pre_begin_check(conn)`` returned a
+              falsy value or raised. The check runs under the held lock
+              so a sweeper can re-verify backlog predicates without
+              releasing the lock between adapter and begin primitive.
+          (e) successor active op already exists (unique partial index
+              idx_compaction_operation_active; the no-throw
+              ``ON CONFLICT DO NOTHING RETURNING`` returns no row and
+              the transaction is rolled back).
+
+        Catching ``UniqueViolation`` inside the open transaction is not
+        a safe rollback boundary in psycopg, so the conflict is steered
+        through ON CONFLICT DO NOTHING plus an explicit sentinel
+        exception that aborts the transaction.
+        """
+        class _ClaimLost(Exception):
+            pass
+
+        now = datetime.now(timezone.utc)
+        inserted = False
+        with self.pool.connection() as conn:
+            try:
+                with conn.transaction():
+                    row = conn.execute(
+                        "SELECT 1 FROM conversation_lifecycle "
+                        "WHERE conversation_id = %s "
+                        "FOR UPDATE SKIP LOCKED",
+                        (conversation_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise _ClaimLost()
+
+                    c_row = conn.execute(
+                        """
+                        SELECT phase, deleted_at, lifecycle_epoch
+                          FROM conversations
+                         WHERE conversation_id = %s
+                        """,
+                        (conversation_id,),
+                    ).fetchone()
+                    if c_row is None or c_row["deleted_at"] is not None:
+                        raise _ClaimLost()
+                    if int(c_row["lifecycle_epoch"]) != lifecycle_epoch:
+                        raise _ClaimLost()
+                    current_phase = str(c_row["phase"])
+                    if required_phase is not None:
+                        if current_phase != required_phase:
+                            raise _ClaimLost()
+                    elif current_phase not in ("active", "ingesting"):
+                        raise _ClaimLost()
+
+                    if pre_begin_check is not None:
+                        try:
+                            ok = pre_begin_check(conn)
+                        except Exception:
+                            raise _ClaimLost()
+                        if not ok:
+                            raise _ClaimLost()
+
+                    cur = conn.execute(
+                        """
+                        UPDATE conversations
+                           SET phase = 'compacting', updated_at = %s
+                         WHERE conversation_id = %s
+                           AND lifecycle_epoch = %s
+                           AND phase = %s
+                        """,
+                        (now, conversation_id, lifecycle_epoch, current_phase),
+                    )
+                    if cur.rowcount == 0:
+                        raise _ClaimLost()
+
+                    insert_result = conn.execute(
+                        """
+                        INSERT INTO compaction_operation (
+                            operation_id, conversation_id, lifecycle_epoch,
+                            phase_index, phase_count, phase_name, status,
+                            started_at, owner_worker_id, heartbeat_ts,
+                            created_at
+                        ) VALUES (
+                            %s, %s, %s, 0, %s, %s, 'running',
+                            %s, %s, %s, %s
+                        )
+                        ON CONFLICT (conversation_id, lifecycle_epoch)
+                          WHERE status IN ('queued','running')
+                        DO NOTHING
+                        RETURNING operation_id
+                        """,
+                        (
+                            new_operation_id, conversation_id,
+                            lifecycle_epoch, phase_count, phase_name,
+                            now, worker_id, now, now,
+                        ),
+                    )
+                    if insert_result.fetchone() is None:
+                        raise _ClaimLost()
+
+                    inserted = True
+            except _ClaimLost:
+                inserted = False
+        return inserted
+
     def start_compaction_operation(
         self,
         *,
@@ -3927,6 +4057,20 @@ class PostgresStore(ContextStore):
         now = datetime.now(timezone.utc)
         with self.pool.connection() as conn:
             with conn.transaction():
+                # Lifecycle-first lock so the takeover serializes against
+                # begin_compaction_with_lock and any future active-op
+                # inserter. Without the lock the cleanup could insert a
+                # new_operation_id row while a concurrent begin already
+                # held a different one, breaking the at-most-one-active
+                # invariant outside the unique-index window.
+                lock = conn.execute(
+                    "SELECT 1 FROM conversation_lifecycle "
+                    "WHERE conversation_id = %s "
+                    "FOR UPDATE",
+                    (conversation_id,),
+                ).fetchone()
+                if lock is None:
+                    return False
                 cur = conn.execute(
                     """UPDATE compaction_operation
                           SET status = 'abandoned', completed_at = %s

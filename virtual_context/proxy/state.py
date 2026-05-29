@@ -899,46 +899,52 @@ class ProxyState:
     def enter_compaction(
         self, *, phase_count: int, initial_phase_name: str = "init",
         operation_id: str | None = None,
-    ) -> None:
-        """Transition phase from ``'active'`` to ``'compacting'`` and start
-        a fresh ``compaction_operation`` row.
+    ) -> bool:
+        """Atomic phase CAS + active-op insert via the lifecycle-locked
+        begin primitive. Returns ``True`` iff this worker inserted the
+        active ``compaction_operation`` row (i.e. won the race against a
+        concurrent enter from another worker or sweeper).
 
-        Epoch-guarded via ``verify_epoch`` at entry. The phase write is
-        additionally epoch-filtered at the SQL layer — a stale caller whose
-        epoch does not match the authoritative conversations row sees
-        ``set_phase`` return False and this method exits without writing
-        the operation row.
+        Returns ``False`` on any precondition failure: lifecycle lock
+        held by another transaction (SKIP LOCKED), conversation deleted,
+        phase not in ``('active', 'ingesting')``, lifecycle_epoch
+        mismatch, or an active successor row already exists. Loser
+        workers must skip ``_run_compaction`` and must NOT call
+        ``exit_compaction`` from their finally block per the fencing
+        plan §3.3 caller-side discipline.
 
-        *operation_id*: when provided, the DB row is inserted with this PK
-        rather than a store-generated UUID. This ensures the row PK matches
-        the id the caller already threaded into downstream per-write
-        ownership-guard kwargs.
+        Epoch-guarded via ``verify_epoch`` at entry; the SQL layer
+        additionally re-verifies the epoch inside the locked
+        transaction so a stale caller fails closed.
+
+        *operation_id*: when provided, the DB row is inserted with this
+        PK rather than a store-generated UUID. The id is also returned
+        through the active op so heartbeat / per-write ownership guards
+        match. When omitted a UUID is generated.
         """
+        import uuid as _uuid
         conv = self.engine.config.conversation_id
         self.engine.verify_epoch()
         epoch = int(self.engine._engine_state.lifecycle_epoch)
-        ok = self.engine._store.set_phase(
-            conversation_id=conv,
-            lifecycle_epoch=epoch,
-            phase="compacting",
-        )
-        if not ok:
-            logger.info(
-                "enter_compaction aborted: phase write rejected"
-                " (epoch mismatch) for conv=%s",
-                conv[:12],
-            )
-            return
-        self.engine._store.start_compaction_operation(
+        new_op = operation_id if operation_id is not None else _uuid.uuid4().hex
+        inserted = self.engine._store.begin_compaction_with_lock(
             conversation_id=conv,
             lifecycle_epoch=epoch,
             worker_id=self._worker_id,
+            new_operation_id=new_op,
             phase_count=phase_count,
             phase_name=initial_phase_name,
-            operation_id=operation_id,
         )
+        if not inserted:
+            logger.info(
+                "enter_compaction aborted: begin_compaction_with_lock "
+                "rejected for conv=%s worker=%s",
+                conv[:12], self._worker_id,
+            )
+            return False
         self._publish_compaction_progress()
         self._publish_phase_transition("active", "compacting")
+        return True
 
     def advance_compaction_phase(
         self, *, phase_index: int, phase_name: str,
@@ -2430,27 +2436,45 @@ class ProxyState:
                 last_advanced_phase_index = 0
                 entered_lifecycle = True
             else:
+                entered_lifecycle = False
                 try:
-                    self.enter_compaction(
+                    entered_lifecycle = bool(self.enter_compaction(
                         phase_count=len(_COMPACT_PHASE_PLAN),
                         initial_phase_name=_COMPACT_PHASE_PLAN[0],
                         operation_id=operation_id,
-                    )
+                    ))
                     last_advanced_phase_index = 0
                 except Exception:
                     logger.warning(
-                        "enter_compaction failed for %s — continuing legacy path only",
+                        "enter_compaction failed for %s; skipping compaction",
                         conversation_id[:12],
                         exc_info=True,
                     )
-                entered_lifecycle = False
-                try:
-                    snap_after_enter = self.engine._store.read_progress_snapshot(
-                        conversation_id,
-                    )
-                    entered_lifecycle = snap_after_enter.active_compaction is not None
-                except Exception:
                     entered_lifecycle = False
+                if not entered_lifecycle:
+                    # Loser path: we did not insert the active
+                    # compaction_operation row, so we must NOT run the
+                    # compaction body or call exit_compaction. Per the
+                    # fencing plan §3.3 the snapshot probe is replaced
+                    # by the explicit return value: a False here means
+                    # another worker owns the active op and we yield
+                    # cleanly to that worker.
+                    logger.info(
+                        "Compaction lifecycle not entered for %s; "
+                        "yielding to active owner",
+                        conversation_id[:12],
+                    )
+                    self._update_compaction_state(
+                        operation_id=operation_id,
+                        status="skipped",
+                        phase="skipped",
+                        phase_name="skipped",
+                        done=0,
+                        total=0,
+                        overall_percent=100,
+                        phase_detail="compaction lifecycle not entered",
+                    )
+                    return
 
             # Spawn the heartbeat sidecar. It refreshes the compaction_operation
             # row every INGESTION_LEASE_TTL_S / 2 seconds while the compactor

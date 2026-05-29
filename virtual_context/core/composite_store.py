@@ -891,6 +891,32 @@ class CompositeStore:
             )
         raise NotImplementedError
 
+    def begin_compaction_with_lock(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        new_operation_id: str,
+        phase_count: int,
+        phase_name: str = "starting",
+        required_phase: str | None = None,
+        pre_begin_check=None,
+    ) -> bool:
+        fn = getattr(self._segments, "begin_compaction_with_lock", None)
+        if callable(fn):
+            return bool(fn(
+                conversation_id=conversation_id,
+                lifecycle_epoch=lifecycle_epoch,
+                worker_id=worker_id,
+                new_operation_id=new_operation_id,
+                phase_count=phase_count,
+                phase_name=phase_name,
+                required_phase=required_phase,
+                pre_begin_check=pre_begin_check,
+            ))
+        return False
+
     def start_compaction_operation(
         self,
         *,

@@ -4068,6 +4068,125 @@ CREATE TABLE IF NOT EXISTS request_captures (
     # conversation was resurrected to a newer epoch is rejected at SQL
     # level.
 
+    def begin_compaction_with_lock(
+        self,
+        *,
+        conversation_id: str,
+        lifecycle_epoch: int,
+        worker_id: str,
+        new_operation_id: str,
+        phase_count: int,
+        phase_name: str = "starting",
+        required_phase: str | None = None,
+        pre_begin_check=None,
+    ) -> bool:
+        """SQLite analog of the Postgres lifecycle-locked begin primitive.
+
+        SQLite has no ``FOR UPDATE SKIP LOCKED``; the
+        ``BEGIN IMMEDIATE`` transaction acquires the database-level
+        write lock and serializes concurrent begin attempts. The
+        contract is identical to the Postgres version: returns True iff
+        this call inserted the active compaction_operation row.
+
+        Other writers (the existing tests + the runtime proxy state)
+        also use IMMEDIATE-flavor transactions so the serialization is
+        coherent.
+        """
+        class _ClaimLost(Exception):
+            pass
+
+        now = utcnow_iso()
+        conn = self._get_conn()
+        inserted = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if row is None:
+                raise _ClaimLost()
+
+            c_row = conn.execute(
+                "SELECT phase, deleted_at, lifecycle_epoch "
+                "  FROM conversations "
+                " WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if c_row is None:
+                raise _ClaimLost()
+            phase, deleted_at, c_epoch = c_row[0], c_row[1], c_row[2]
+            if deleted_at is not None and deleted_at != "":
+                raise _ClaimLost()
+            if int(c_epoch) != lifecycle_epoch:
+                raise _ClaimLost()
+            current_phase = str(phase)
+            if required_phase is not None:
+                if current_phase != required_phase:
+                    raise _ClaimLost()
+            elif current_phase not in ("active", "ingesting"):
+                raise _ClaimLost()
+
+            if pre_begin_check is not None:
+                try:
+                    ok = pre_begin_check(conn)
+                except Exception:
+                    raise _ClaimLost()
+                if not ok:
+                    raise _ClaimLost()
+
+            cur = conn.execute(
+                "UPDATE conversations "
+                "   SET phase = 'compacting', updated_at = ? "
+                " WHERE conversation_id = ? "
+                "   AND lifecycle_epoch = ? "
+                "   AND phase = ?",
+                (now, conversation_id, lifecycle_epoch, current_phase),
+            )
+            if cur.rowcount == 0:
+                raise _ClaimLost()
+
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO compaction_operation (
+                        operation_id, conversation_id, lifecycle_epoch,
+                        phase_index, phase_count, phase_name, status,
+                        started_at, owner_worker_id, heartbeat_ts
+                    ) VALUES (?, ?, ?, 0, ?, ?, 'running',
+                              ?, ?, ?)
+                    """,
+                    (
+                        new_operation_id, conversation_id, lifecycle_epoch,
+                        phase_count, phase_name, now, worker_id, now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # idx_compaction_operation_active partial unique index
+                # already covers (conversation_id, lifecycle_epoch) for
+                # status IN ('queued','running'). A concurrent winner
+                # races us; the transaction rolls back below.
+                raise _ClaimLost()
+            inserted = True
+        except _ClaimLost:
+            inserted = False
+        except Exception:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+
+        if inserted:
+            conn.commit()
+        else:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        return inserted
+
     def start_compaction_operation(
         self,
         *,
@@ -4211,7 +4330,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
            (conversation_id, lifecycle_epoch).
         """
         now = utcnow_iso()
-        with self._get_conn() as conn:
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            # Lifecycle-first lock so takeover serializes against any
+            # active-op inserter (begin_compaction_with_lock or another
+            # takeover). SQLite's BEGIN IMMEDIATE acquires the
+            # database-level write lock; the explicit SELECT confirms
+            # the lifecycle row exists.
+            lock = conn.execute(
+                "SELECT 1 FROM conversation_lifecycle "
+                "WHERE conversation_id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if lock is None:
+                conn.rollback()
+                return False
             cur = conn.execute(
                 """UPDATE compaction_operation
                       SET status = 'abandoned', completed_at = ?
@@ -4252,7 +4386,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         phase_count, now, now, worker_id, now,
                     ),
                 )
-            self._commit_if_unlocked(conn)
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
         return fresh_takeover
 
     def refresh_compaction_heartbeat(
