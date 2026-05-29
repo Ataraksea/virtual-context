@@ -202,22 +202,31 @@ class TestM0SignatureBackwardCompat:
         store.set_fact_superseded("a", "b")
 
     def test_set_fact_superseded_fenced_call(self):
+        # P3 contract: when guard kwargs are supplied and no matching
+        # running compaction_operation row exists, the method rejects
+        # the write by raising CompactionLeaseLost. The M0 signature
+        # contract is preserved (kwargs are accepted) while P3 takes
+        # over the behavior.
+        from virtual_context.types import CompactionLeaseLost
         store = _make_store()
-        store.set_fact_superseded(
-            "a", "b",
-            operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=2,
-        )
+        with pytest.raises(CompactionLeaseLost):
+            store.set_fact_superseded(
+                "a", "b",
+                operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=2,
+            )
 
     def test_update_fact_fields_legacy_call(self):
         store = _make_store()
         store.update_fact_fields("a", "v", "o", "active", "what")
 
     def test_update_fact_fields_fenced_call(self):
+        from virtual_context.types import CompactionLeaseLost
         store = _make_store()
-        store.update_fact_fields(
-            "a", "v", "o", "active", "what",
-            operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=2,
-        )
+        with pytest.raises(CompactionLeaseLost):
+            store.update_fact_fields(
+                "a", "v", "o", "active", "what",
+                operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=2,
+            )
 
     def test_store_fact_links_legacy_call(self):
         store = _make_store()
@@ -226,6 +235,8 @@ class TestM0SignatureBackwardCompat:
         assert store.store_fact_links([]) == 0
 
     def test_store_fact_links_fenced_call(self):
+        # P3: empty links list short-circuits before the guard, so an
+        # empty-list call with fenced kwargs still trivially returns 0.
         store = _make_store()
         assert (
             store.store_fact_links(
@@ -242,12 +253,17 @@ class TestM0SignatureBackwardCompat:
         store.store_chunk_embeddings("seg-1", [])
 
     def test_store_chunk_embeddings_fenced_call(self):
+        # P3 contract: the segment-ownership probe fires before the
+        # DELETE/INSERT loop, so an unseeded store rejects the write
+        # via CompactionLeaseLost.
+        from virtual_context.types import CompactionLeaseLost
         store = _make_store()
-        store.store_chunk_embeddings(
-            "seg-1", [],
-            operation_id="op-1", owner_worker_id="w-1",
-            lifecycle_epoch=2, conversation_id="conv-1",
-        )
+        with pytest.raises(CompactionLeaseLost):
+            store.store_chunk_embeddings(
+                "seg-1", [],
+                operation_id="op-1", owner_worker_id="w-1",
+                lifecycle_epoch=2, conversation_id="conv-1",
+            )
 
     def test_link_segment_tool_output_legacy_call(self):
         store = _make_store()
@@ -255,8 +271,11 @@ class TestM0SignatureBackwardCompat:
         store.link_segment_tool_output("conv-1", "seg-1", "tool-1")
 
     def test_link_segment_tool_output_fenced_call(self):
+        # P3 contract: guard-gated INSERT rejects when no matching op.
+        from virtual_context.types import CompactionLeaseLost
         store = _make_store()
-        store.link_segment_tool_output(
-            "conv-1", "seg-1", "tool-1",
-            operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=2,
-        )
+        with pytest.raises(CompactionLeaseLost):
+            store.link_segment_tool_output(
+                "conv-1", "seg-1", "tool-1",
+                operation_id="op-1", owner_worker_id="w-1", lifecycle_epoch=2,
+            )

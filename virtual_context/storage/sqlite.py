@@ -284,6 +284,47 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _validate_compaction_guard_kwargs(
+    operation_id: str | None,
+    owner_worker_id: str | None,
+    lifecycle_epoch: int | None,
+    conversation_id: str | None = ...,  # type: ignore[assignment]
+) -> None:
+    """Reject mixed-partial compaction guard kwargs as programming errors.
+
+    Per fencing plan §5.7 T3.19, the guard contract for fenced writes is
+    binary: either all operation guard kwargs are ``None`` (legacy
+    unguarded path) or all are non-``None`` (fenced path with active
+    op). Mixed partial kwargs are a programming error and silently
+    bypassing the fence would hide a caller bug.
+
+    The triple ``(operation_id, owner_worker_id, lifecycle_epoch)`` is
+    always required as a group. ``conversation_id`` is required only when
+    that full triple is supplied for methods whose fence contract needs
+    conversation scope (``store_chunk_embeddings``, ``store_fact_links``);
+    for other methods the caller passes ``...`` as the sentinel to skip
+    its check.
+    """
+    triple = (operation_id, owner_worker_id, lifecycle_epoch)
+    none_count = sum(1 for v in triple if v is None)
+    if none_count not in (0, len(triple)):
+        raise ValueError(
+            "compaction guard kwargs must be all-None or all-non-None; "
+            f"got operation_id={operation_id!r}, "
+            f"owner_worker_id={owner_worker_id!r}, "
+            f"lifecycle_epoch={lifecycle_epoch!r}"
+        )
+    if conversation_id is not ... and none_count == 0 and conversation_id is None:
+        raise ValueError(
+            "compaction guard kwargs for this method require conversation_id "
+            "when operation_id, owner_worker_id, and lifecycle_epoch are supplied; "
+            f"got operation_id={operation_id!r}, "
+            f"owner_worker_id={owner_worker_id!r}, "
+            f"lifecycle_epoch={lifecycle_epoch!r}, "
+            f"conversation_id={conversation_id!r}"
+        )
+
+
 def _sanitize_fts_query(query: str) -> str:
     """Quote user input so FTS5 treats it as a phrase, not operator syntax.
 
@@ -5169,15 +5210,68 @@ CREATE TABLE IF NOT EXISTS request_captures (
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
     ) -> None:
+        """Store chunk embeddings for a segment.
+
+        When all guard kwargs are supplied, the DELETE and INSERTs are
+        gated on a probe that verifies (1) the segment_ref belongs to
+        the supplied conversation_id (via segments JOIN, not trusting
+        the caller-supplied conversation_id) AND (2) the active op
+        matches the guard triple at status='running'. Per fencing
+        plan §5.4 P1-3 fold. Inserted rows carry operation_id so
+        cleanup_abandoned_compaction can DELETE them on takeover.
+        """
+        from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+            and conversation_id is not None
+        )
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if guard_all:
+                probe = conn.execute(
+                    """SELECT 1
+                         FROM segments s, compaction_operation co
+                        WHERE s.ref = ?
+                          AND s.conversation_id = ?
+                          AND co.conversation_id = s.conversation_id
+                          AND co.operation_id = ?
+                          AND co.owner_worker_id = ?
+                          AND co.lifecycle_epoch = ?
+                          AND co.status = 'running'""",
+                    (
+                        segment_ref, conversation_id,
+                        operation_id, owner_worker_id, lifecycle_epoch,
+                    ),
+                ).fetchone()
+                if probe is None:
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="store_chunk_embeddings",
+                    )
             conn.execute("DELETE FROM segment_chunks WHERE segment_ref = ?", (segment_ref,))
             for chunk in chunks:
-                conn.execute(
-                    "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (?, ?, ?, ?)",
-                    (chunk.segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
-                )
+                if guard_all:
+                    conn.execute(
+                        """INSERT INTO segment_chunks
+                        (segment_ref, chunk_index, text, embedding_json, operation_id)
+                        VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            segment_ref, chunk.chunk_index, chunk.text,
+                            json.dumps(chunk.embedding), operation_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO segment_chunks (segment_ref, chunk_index, text, embedding_json) VALUES (?, ?, ?, ?)",
+                        (chunk.segment_ref, chunk.chunk_index, chunk.text, json.dumps(chunk.embedding)),
+                    )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -6338,9 +6432,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> int:
+        from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+        )
         if not facts:
             return 0
-        from ..types import CompactionLeaseLost
 
         guard_all = (
             operation_id is not None
@@ -6361,12 +6458,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     # batch, so a concurrent takeover cannot interleave between
                     # rows. However, a takeover that completes *before* the
                     # first INSERT fires (at-rest stale) is caught here.
+                    # Stamps facts.operation_id so cleanup_abandoned_compaction
+                    # can DELETE the op-owned rows on takeover. Per fencing
+                    # plan iter-2 P1-2.
                     cur = conn.execute(
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by)
-                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         turn_numbers_json, mentioned_at, session_date, superseded_by, operation_id)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                           FROM compaction_operation
                          WHERE operation_id = ?
                            AND conversation_id = ?
@@ -6392,6 +6492,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             _dt_to_str(fact.mentioned_at),
                             fact.session_date or "",
                             fact.superseded_by,
+                            operation_id,
                             # WHERE clause params:
                             operation_id,
                             fact.conversation_id,
@@ -6579,6 +6680,9 @@ CREATE TABLE IF NOT EXISTS request_captures (
         behaviour is unchanged: unconditional DELETE + INSERT.
         """
         from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+        )
 
         guard_all = (
             operation_id is not None
@@ -6625,12 +6729,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
             count = 0
             for fact in facts:
                 if guard_all:
+                    # Stamps facts.operation_id so cleanup_abandoned_compaction
+                    # can DELETE the op-owned rows on takeover. Per fencing
+                    # plan iter-2 P1-2.
                     cur = conn.execute(
                         """INSERT OR REPLACE INTO facts
                         (id, subject, verb, object, status, what, who, when_date,
                          "where", why, fact_type, tags_json, segment_ref, conversation_id,
-                         turn_numbers_json, mentioned_at, session_date, superseded_by)
-                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                         turn_numbers_json, mentioned_at, session_date, superseded_by, operation_id)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                           FROM compaction_operation
                          WHERE operation_id = ?
                            AND conversation_id = ?
@@ -6643,7 +6750,7 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             fact.fact_type, json.dumps(fact.tags), fact.segment_ref,
                             fact.conversation_id, json.dumps(fact.turn_numbers),
                             _dt_to_str(fact.mentioned_at), fact.session_date or "",
-                            fact.superseded_by,
+                            fact.superseded_by, operation_id,
                             # WHERE clause params:
                             operation_id, fact.conversation_id,
                             owner_worker_id, lifecycle_epoch,
@@ -6748,11 +6855,59 @@ CREATE TABLE IF NOT EXISTS request_captures (
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE facts SET superseded_by = ? WHERE id = ?",
-            (new_fact_id, old_fact_id),
+        """Mark ``old_fact_id`` superseded by ``new_fact_id``.
+
+        When all guard kwargs are supplied, the UPDATE is gated on a
+        running ``compaction_operation`` row matching the guard triple
+        AND both endpoint facts belonging to the same conversation as
+        the active op. Blocks cross-conversation supersession pointers
+        per fencing plan §4.3 P1-8 fold.
+        """
+        from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
         )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+        conn = self._get_conn()
+        if guard_all:
+            cur = conn.execute(
+                """UPDATE facts
+                      SET superseded_by = ?
+                    WHERE id = ?
+                      AND EXISTS (
+                          SELECT 1
+                            FROM facts f_old, facts f_new,
+                                 compaction_operation co
+                           WHERE f_old.id = ?
+                             AND f_new.id = ?
+                             AND f_old.conversation_id = f_new.conversation_id
+                             AND co.conversation_id = f_old.conversation_id
+                             AND co.operation_id = ?
+                             AND co.owner_worker_id = ?
+                             AND co.lifecycle_epoch = ?
+                             AND co.status = 'running'
+                      )""",
+                (
+                    new_fact_id, old_fact_id,
+                    old_fact_id, new_fact_id,
+                    operation_id, owner_worker_id, lifecycle_epoch,
+                ),
+            )
+            if (cur.rowcount or 0) == 0:
+                conn.rollback()
+                raise CompactionLeaseLost(
+                    operation_id=operation_id,
+                    write_site="set_fact_superseded",
+                )
+        else:
+            conn.execute(
+                "UPDATE facts SET superseded_by = ? WHERE id = ?",
+                (new_fact_id, old_fact_id),
+            )
         conn.commit()
 
     def update_fact_fields(
@@ -6767,11 +6922,52 @@ CREATE TABLE IF NOT EXISTS request_captures (
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
-            (verb, object, status, what, fact_id),
+        """Update mutable fact fields. When all guard kwargs are
+        supplied, the UPDATE only fires if the target fact belongs to
+        the same conversation as the active op (matched on the guard
+        triple at status='running').
+        """
+        from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
         )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+        conn = self._get_conn()
+        if guard_all:
+            cur = conn.execute(
+                """UPDATE facts
+                      SET verb = ?, object = ?, status = ?, what = ?
+                    WHERE id = ?
+                      AND EXISTS (
+                          SELECT 1
+                            FROM facts f, compaction_operation co
+                           WHERE f.id = ?
+                             AND co.conversation_id = f.conversation_id
+                             AND co.operation_id = ?
+                             AND co.owner_worker_id = ?
+                             AND co.lifecycle_epoch = ?
+                             AND co.status = 'running'
+                      )""",
+                (
+                    verb, object, status, what, fact_id,
+                    fact_id, operation_id, owner_worker_id, lifecycle_epoch,
+                ),
+            )
+            if (cur.rowcount or 0) == 0:
+                conn.rollback()
+                raise CompactionLeaseLost(
+                    operation_id=operation_id,
+                    write_site="update_fact_fields",
+                )
+        else:
+            conn.execute(
+                "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
+                (verb, object, status, what, fact_id),
+            )
         # FTS5 sync handled by AFTER UPDATE trigger (facts_fts_au)
         conn.commit()
 
@@ -6823,29 +7019,95 @@ CREATE TABLE IF NOT EXISTS request_captures (
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
     ) -> int:
+        """Insert fact_links rows.
+
+        When all guard kwargs are supplied (including conversation_id),
+        each INSERT only fires for a link whose BOTH endpoint facts
+        belong to the supplied conversation AND the active op matches
+        the guard triple at status='running'. Inserted rows carry
+        operation_id so cleanup_abandoned_compaction can DELETE the
+        op-owned rows on takeover. Per fencing plan §4.3 P1-7 fold.
+        """
+        from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
+            conversation_id=conversation_id,
+        )
         if not links:
             return 0
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+            and conversation_id is not None
+        )
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
             count = 0
             for link in links:
-                conn.execute(
-                    """INSERT OR REPLACE INTO fact_links
-                    (id, source_fact_id, target_fact_id, relation_type,
-                     confidence, context, created_at, created_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        link.id,
-                        link.source_fact_id,
-                        link.target_fact_id,
-                        link.relation_type,
-                        link.confidence,
-                        link.context,
-                        _dt_to_str(link.created_at),
-                        link.created_by,
-                    ),
-                )
+                if guard_all:
+                    cur = conn.execute(
+                        """INSERT INTO fact_links (
+                            id, source_fact_id, target_fact_id, relation_type,
+                            confidence, context, created_at, created_by,
+                            operation_id
+                        )
+                        SELECT ?,?,?,?,?,?,?,?,?
+                          FROM facts f_src, facts f_tgt, compaction_operation co
+                         WHERE f_src.id = ?
+                           AND f_tgt.id = ?
+                           AND f_src.conversation_id = ?
+                           AND f_tgt.conversation_id = ?
+                           AND co.conversation_id = ?
+                           AND co.operation_id = ?
+                           AND co.owner_worker_id = ?
+                           AND co.lifecycle_epoch = ?
+                           AND co.status = 'running'
+                        ON CONFLICT (id) DO NOTHING""",
+                        (
+                            link.id, link.source_fact_id, link.target_fact_id,
+                            link.relation_type, link.confidence, link.context,
+                            _dt_to_str(link.created_at), link.created_by,
+                            operation_id,
+                            link.source_fact_id, link.target_fact_id,
+                            conversation_id, conversation_id,
+                            conversation_id, operation_id,
+                            owner_worker_id, lifecycle_epoch,
+                        ),
+                    )
+                    # rowcount=0 can mean ON CONFLICT skip (idempotent
+                    # re-insert) OR guard mismatch. Distinguish via a
+                    # pre-existence check: if a row with this id already
+                    # exists, treat as idempotent; otherwise the guard
+                    # rejected.
+                    if (cur.rowcount or 0) == 0:
+                        pre_existing = conn.execute(
+                            "SELECT 1 FROM fact_links WHERE id = ?",
+                            (link.id,),
+                        ).fetchone()
+                        if pre_existing is None:
+                            raise CompactionLeaseLost(
+                                operation_id=operation_id,
+                                write_site="store_fact_links",
+                            )
+                else:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO fact_links
+                        (id, source_fact_id, target_fact_id, relation_type,
+                         confidence, context, created_at, created_by)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            link.id,
+                            link.source_fact_id,
+                            link.target_fact_id,
+                            link.relation_type,
+                            link.confidence,
+                            link.context,
+                            _dt_to_str(link.created_at),
+                            link.created_by,
+                        ),
+                    )
                 count += 1
             conn.execute("COMMIT")
             return count
@@ -7149,12 +7411,63 @@ CREATE TABLE IF NOT EXISTS request_captures (
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> None:
-        conn = self._get_conn()
-        conn.execute(
-            """INSERT OR IGNORE INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
-            VALUES (?, ?, ?)""",
-            (conversation_id, segment_ref, tool_output_ref),
+        """Insert a segment_tool_outputs link. When all guard kwargs are
+        supplied, the INSERT only fires if the active op matches the
+        guard triple at status='running' for the supplied
+        conversation_id. Inserted row carries operation_id for
+        cleanup-on-takeover.
+        """
+        from ..types import CompactionLeaseLost
+        _validate_compaction_guard_kwargs(
+            operation_id, owner_worker_id, lifecycle_epoch,
         )
+        guard_all = (
+            operation_id is not None
+            and owner_worker_id is not None
+            and lifecycle_epoch is not None
+        )
+        conn = self._get_conn()
+        if guard_all:
+            cur = conn.execute(
+                """INSERT INTO segment_tool_outputs
+                (conversation_id, segment_ref, tool_output_ref, operation_id)
+                SELECT ?, ?, ?, ?
+                  FROM compaction_operation co
+                 WHERE co.conversation_id = ?
+                   AND co.operation_id = ?
+                   AND co.owner_worker_id = ?
+                   AND co.lifecycle_epoch = ?
+                   AND co.status = 'running'
+                ON CONFLICT (conversation_id, segment_ref, tool_output_ref) DO NOTHING""",
+                (
+                    conversation_id, segment_ref, tool_output_ref, operation_id,
+                    conversation_id, operation_id,
+                    owner_worker_id, lifecycle_epoch,
+                ),
+            )
+            # rowcount=0 can mean ON CONFLICT skip (idempotent re-link)
+            # OR guard mismatch. Distinguish via a pre-existence check:
+            # if a matching row already exists, the link is idempotent;
+            # otherwise the guard rejected.
+            if (cur.rowcount or 0) == 0:
+                pre_existing = conn.execute(
+                    """SELECT 1 FROM segment_tool_outputs
+                        WHERE conversation_id = ?
+                          AND segment_ref = ?
+                          AND tool_output_ref = ?""",
+                    (conversation_id, segment_ref, tool_output_ref),
+                ).fetchone()
+                if pre_existing is None:
+                    raise CompactionLeaseLost(
+                        operation_id=operation_id,
+                        write_site="link_segment_tool_output",
+                    )
+        else:
+            conn.execute(
+                """INSERT OR IGNORE INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
+                VALUES (?, ?, ?)""",
+                (conversation_id, segment_ref, tool_output_ref),
+            )
         conn.commit()
 
     def get_tool_outputs_for_segment(self, conversation_id: str, segment_ref: str) -> list[str]:
