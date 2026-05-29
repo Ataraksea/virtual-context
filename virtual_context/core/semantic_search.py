@@ -154,6 +154,7 @@ class SemanticSearchManager:
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
         conversation_id: str | None = None,
+        disable_replacement_passes: bool = False,
     ) -> None:
         """Compute and store chunk embeddings for a segment.
 
@@ -163,10 +164,27 @@ class SemanticSearchManager:
         propagation). Legacy non-compaction callers (the lazy backfill
         path at line ~409 below) omit the kwargs and continue through
         the documented all-None branch.
+
+        When ``disable_replacement_passes`` is True (backlog-sweeper
+        dispatch), the caller suppresses the DELETE-then-INSERT
+        semantics by skipping the write entirely when the segment_ref
+        already has chunks. The new-segment path is a pure insert and
+        proceeds normally. Per fencing plan §7.2 #4.
         """
         embed_fn = self.get_embed_fn()
         if embed_fn is None:
             return
+        if disable_replacement_passes:
+            existing = [
+                c for c in self._store.get_all_chunk_embeddings()
+                if c.segment_ref == stored.ref
+            ]
+            if existing:
+                logger.info(
+                    "C2R gate: skipping chunk embedding write for segment %s "
+                    "(%d pre-existing chunks)", stored.ref, len(existing),
+                )
+                return
         chunks = chunk_segment_text(stored.full_text)
         if not chunks:
             return

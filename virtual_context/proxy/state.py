@@ -2273,6 +2273,34 @@ class ProxyState:
         except Exception as e:
             logger.error("tag_split error: %s", e, exc_info=True)
 
+    @staticmethod
+    def _resolve_c2r_gate(
+        signal: object, explicit: bool | None,
+    ) -> bool:
+        """Resolve the C2R (``disable_replacement_passes``) gate.
+
+        Per fencing plan §7.3, the gate is True when:
+
+        * the caller passes ``True`` explicitly, OR
+        * no explicit value is supplied AND the dispatching signal
+          has ``priority == "backlog"`` (i.e. the backlog sweeper
+          fired this compaction and any replacement write would
+          collide with content owned by another operation).
+
+        Otherwise the gate is False so proxy LLM compaction
+        (priorities ``"soft"`` / ``"hard"`` / ``"takeover"``) keeps
+        its full replacement semantics. The two-direction override
+        in T5.8 reflects this: a caller can force the gate ON for a
+        non-backlog dispatch and OFF for a backlog dispatch.
+        """
+        if explicit is not None:
+            return bool(explicit)
+        try:
+            priority = str(getattr(signal, "priority", "") or "")
+        except Exception:
+            priority = ""
+        return priority == "backlog"
+
     def _run_compact(
         self,
         history: list[Message],
@@ -2281,6 +2309,7 @@ class ProxyState:
         turn_id: str = "",
         *,
         preexisting_operation_id: str | None = None,
+        disable_replacement_passes: bool | None = None,
     ) -> None:
         """Background compaction — runs in _compact_pool, doesn't block next request.
 
@@ -2293,8 +2322,18 @@ class ProxyState:
         enter / each phase advance / exit. See ``enter_compaction``,
         ``advance_compaction_phase``, and ``exit_compaction`` on
         ``ProxyState`` for the underlying primitives.
+
+        *disable_replacement_passes*: when explicitly supplied, threaded
+        through to ``compact_if_needed``. When left ``None``, a default
+        is derived from ``signal.priority == "backlog"`` so a direct
+        caller that hands in a backlog signal still gets the C2R gate
+        without needing to set the flag separately. Per fencing plan
+        §7.2 dispatch-flow description.
         """
         conversation_id = self.engine.config.conversation_id
+        disable_replacement_passes = self._resolve_c2r_gate(
+            signal, disable_replacement_passes,
+        )
         if preexisting_operation_id is not None:
             # Takeover path: the caller pre-inserted the compaction_operation
             # row (e.g. via cleanup_abandoned_compaction). Use the supplied
@@ -2525,27 +2564,39 @@ class ProxyState:
                     if not callable(compact_target):
                         compact_target = compact_if_needed
                     supports_turn_id = True
+                    supports_operation_id = True
+                    supports_disable_replacement_passes = True
                     try:
                         signature = inspect.signature(compact_target)
+                        accepts_kwargs = any(
+                            param.kind == inspect.Parameter.VAR_KEYWORD
+                            for param in signature.parameters.values()
+                        )
                         supports_turn_id = (
                             "turn_id" in signature.parameters
-                            or any(
-                                param.kind == inspect.Parameter.VAR_KEYWORD
-                                for param in signature.parameters.values()
-                            )
+                            or accepts_kwargs
+                        )
+                        supports_operation_id = (
+                            "operation_id" in signature.parameters
+                            or accepts_kwargs
+                        )
+                        supports_disable_replacement_passes = (
+                            "disable_replacement_passes" in signature.parameters
+                            or accepts_kwargs
                         )
                     except (TypeError, ValueError):
                         supports_turn_id = True
+                        supports_operation_id = True
+                        supports_disable_replacement_passes = True
 
+                    compact_kwargs = {"progress_callback": _compact_progress}
                     if supports_turn_id:
-                        report = compact_if_needed(
-                            history, signal, progress_callback=_compact_progress,
-                            turn_id=turn_id, operation_id=operation_id,
-                        )
-                    else:
-                        report = self.engine.compact_if_needed(
-                            history, signal, progress_callback=_compact_progress,
-                        )
+                        compact_kwargs["turn_id"] = turn_id
+                    if supports_operation_id:
+                        compact_kwargs["operation_id"] = operation_id
+                    if supports_disable_replacement_passes:
+                        compact_kwargs["disable_replacement_passes"] = disable_replacement_passes
+                    report = compact_if_needed(history, signal, **compact_kwargs)
                     compact_ms = round((time.monotonic() - t0) * 1000, 1)
 
                     if report is not None:
@@ -2711,10 +2762,12 @@ class ProxyState:
         turn_id: str = "",
         *,
         preexisting_operation_id: str | None = None,
+        disable_replacement_passes: bool | None = None,
     ) -> None:
         try:
             self._run_compact(history, signal, turn, turn_id=turn_id,
-                              preexisting_operation_id=preexisting_operation_id)
+                              preexisting_operation_id=preexisting_operation_id,
+                              disable_replacement_passes=disable_replacement_passes)
         finally:
             # Always clear the active op so the takeover predicate is unblocked.
             self._active_compaction_op = None

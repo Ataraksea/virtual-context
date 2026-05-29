@@ -214,6 +214,7 @@ class CompactionPipeline:
         operation_id: str | None = None,
         *,
         preexisting_operation_id: str | None = None,
+        disable_replacement_passes: bool = False,
     ) -> CompactionReport | None:
         """Phase 2 of turn processing: run compaction.
 
@@ -228,6 +229,16 @@ class CompactionPipeline:
         *preexisting_operation_id*: when set by the takeover path, overrides
         *operation_id* so all downstream guarded writes use the pre-inserted
         row's id rather than a freshly generated one.
+        *disable_replacement_passes*: when True, the compaction dispatch
+        forces insert-only behavior at every gated call site
+        (merge-into-existing-segment route, ``replace_facts_for_segment``,
+        ``store_chunk_embeddings``, ``save_tag_summary``,
+        ``store_tag_summary_embedding``, and the
+        ``FactLinkChecker.check_and_link`` /
+        ``FactSupersessionChecker.check_and_supersede`` mutation passes).
+        Backlog-sweeper dispatches set this to True so a recovery
+        compaction cannot overwrite content owned by other operations.
+        Per fencing plan §7 / spec v1.4 §1.4.
         """
         if preexisting_operation_id is not None:
             operation_id = preexisting_operation_id
@@ -273,6 +284,7 @@ class CompactionPipeline:
             progress_callback=progress_callback,
             generated_by_turn_id=turn_id,
             operation_id=operation_id,
+            disable_replacement_passes=disable_replacement_passes,
         )
 
         self._engine_state.last_compact_ms = round((time.monotonic() - _t_compact) * 1000, 1)
@@ -284,6 +296,8 @@ class CompactionPipeline:
         conversation_history: list[Message],
         turn_id: str = "",
         operation_id: str | None = None,
+        *,
+        disable_replacement_passes: bool = False,
     ) -> CompactionReport | None:
         """Trigger manual compaction regardless of thresholds.
 
@@ -291,6 +305,8 @@ class CompactionPipeline:
         watermark, protected recent turns, advances the watermark, stores
         segments, and rebuilds tag summaries for affected tags.
         *operation_id*: see ``compact_if_needed`` for ownership-guard semantics.
+        *disable_replacement_passes*: see ``compact_if_needed`` for the
+        C2R gate semantics.
         """
         if self._compactor is None:
             logger.warning("No LLM provider configured for compaction")
@@ -309,6 +325,7 @@ class CompactionPipeline:
             compact_rows=compact_rows,
             generated_by_turn_id=turn_id,
             operation_id=operation_id,
+            disable_replacement_passes=disable_replacement_passes,
         )
 
         self._commit_compaction_state(conversation_history)
@@ -363,6 +380,7 @@ class CompactionPipeline:
         generated_by_turn_id: str = "",
         operation_id: str | None = None,
         preexisting_operation_id: str | None = None,
+        disable_replacement_passes: bool = False,
     ) -> CompactionReport:
         """Shared compaction core: segment, compact, store, build tag summaries.
 
@@ -459,6 +477,7 @@ class CompactionPipeline:
             progress_callback=progress_callback,
             generated_by_turn_id=generated_by_turn_id,
             operation_id=operation_id,
+            disable_replacement_passes=disable_replacement_passes,
         )
 
         compacted_turn_ids = [
@@ -485,6 +504,7 @@ class CompactionPipeline:
             operation_id=operation_id,
             generated_by_turn_id=generated_by_turn_id,
             progress_callback=progress_callback,
+            disable_replacement_passes=disable_replacement_passes,
         )
 
         report = CompactionReport(
@@ -508,6 +528,7 @@ class CompactionPipeline:
         operation_id: str | None,
         generated_by_turn_id: str = "",
         progress_callback: Callable[..., None] | None = None,
+        disable_replacement_passes: bool = False,
     ) -> tuple[int, list[str]]:
         """Build and persist tag summaries for the just-compacted segments.
 
@@ -636,16 +657,37 @@ class CompactionPipeline:
         )
 
         for ts_i, ts in enumerate(new_tag_summaries):
-            self._store.save_tag_summary(
-                ts,
-                conversation_id=self._config.conversation_id,
-                **self._compaction_guard_kwargs(operation_id),
-            )
+            # C2R gate (fencing plan §7.2 #5 + #6): backlog-sweeper
+            # dispatches skip both ``save_tag_summary`` and
+            # ``store_tag_summary_embedding`` when a row already
+            # exists for ``(tag, conversation_id)`` so the recovery
+            # compaction cannot UPSERT over content owned by another
+            # operation. The two writes share the lockstep invariant
+            # (the tag-summary row gates the embedding row) so a
+            # single existence probe via ``get_tag_summary`` covers
+            # both.
+            _skip_ts = False
+            if disable_replacement_passes:
+                _existing_ts = self._store.get_tag_summary(
+                    ts.tag, conversation_id=self._config.conversation_id,
+                )
+                if _existing_ts is not None:
+                    logger.info(
+                        "  C2R gate: skipping tag summary write for "
+                        "tag %s (pre-existing row)", ts.tag,
+                    )
+                    _skip_ts = True
+            if not _skip_ts:
+                self._store.save_tag_summary(
+                    ts,
+                    conversation_id=self._config.conversation_id,
+                    **self._compaction_guard_kwargs(operation_id),
+                )
             # Compute and store tag summary embedding for RRF scoring.
             try:
                 from ..types import CompactionLeaseLost as _CLL
                 embed_fn = self._semantic.get_embed_fn() if self._semantic else None
-                if embed_fn and ts.summary:
+                if embed_fn and ts.summary and not _skip_ts:
                     emb = embed_fn([ts.summary[:2000]])[0]
                     self._store.store_tag_summary_embedding(
                         ts.tag, self._config.conversation_id, emb,
@@ -713,6 +755,7 @@ class CompactionPipeline:
         progress_callback: Callable[..., None] | None = None,
         generated_by_turn_id: str = "",
         operation_id: str | None = None,
+        disable_replacement_passes: bool = False,
     ) -> list[CompactionResult]:
         """Two-pass compact and store.
 
@@ -884,7 +927,12 @@ class CompactionPipeline:
                 continue
 
             # --- Merge check: find best existing segment to merge with ---
-            if merge_lookback > 0:
+            # C2R gate (fencing plan §7.2 #1): backlog-sweeper dispatches
+            # force pure-insert behavior by skipping merge candidate
+            # selection entirely. Without this, a recovery compaction
+            # could merge into an existing segment and overwrite
+            # content owned by other operations.
+            if merge_lookback > 0 and not disable_replacement_passes:
                 candidates = self._store.get_segments_by_tags(
                     tags=seg.tags, min_overlap=1, limit=merge_lookback,
                     conversation_id=self._config.conversation_id,
@@ -1054,6 +1102,7 @@ class CompactionPipeline:
                     **self._compaction_guard_kwargs(
                         operation_id, include_conversation_id=True,
                     ),
+                    disable_replacement_passes=disable_replacement_passes,
                 )
                 result.segment_id = seg.merge_ref
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
@@ -1089,6 +1138,7 @@ class CompactionPipeline:
                     **self._compaction_guard_kwargs(
                         operation_id, include_conversation_id=True,
                     ),
+                    disable_replacement_passes=disable_replacement_passes,
                 )
                 session_date = getattr(result.metadata, 'session_date', '') if result.metadata else ''
                 logger.info(
@@ -1124,18 +1174,48 @@ class CompactionPipeline:
                 for fact in result.facts:
                     fact.segment_ref = _seg_ref
                     fact.conversation_id = self._config.conversation_id
-                _deleted, _inserted = self._store.replace_facts_for_segment(
-                    self._config.conversation_id, _seg_ref, result.facts,
-                    **self._compaction_guard_kwargs(operation_id),
-                )
-                if _deleted:
-                    logger.info("  Replaced %d old facts with %d new for segment %s",
-                                _deleted, _inserted, result.primary_tag)
+                # C2R gate (fencing plan §7.2 #3): backlog-sweeper
+                # dispatches skip ``replace_facts_for_segment`` when
+                # the segment already has facts so the recovery
+                # compaction cannot DELETE-then-INSERT facts owned by
+                # other operations. The new-segment path
+                # (no pre-existing facts) is a pure insert and runs
+                # normally.
+                _skip_facts = False
+                if disable_replacement_passes:
+                    _existing = self._store.get_facts_by_segment(_seg_ref)
+                    if _existing:
+                        logger.info(
+                            "  C2R gate: skipping fact replacement for "
+                            "segment %s (%d pre-existing facts)",
+                            result.primary_tag, len(_existing),
+                        )
+                        _skip_facts = True
+                if _skip_facts:
+                    _deleted, _inserted = 0, 0
                 else:
-                    logger.info("  Stored %d facts for segment %s", _inserted, result.primary_tag)
+                    _deleted, _inserted = self._store.replace_facts_for_segment(
+                        self._config.conversation_id, _seg_ref, result.facts,
+                        **self._compaction_guard_kwargs(operation_id),
+                    )
+                    if _deleted:
+                        logger.info("  Replaced %d old facts with %d new for segment %s",
+                                    _deleted, _inserted, result.primary_tag)
+                    else:
+                        logger.info("  Stored %d facts for segment %s", _inserted, result.primary_tag)
                 _superseded_count = 0
                 _links_count = 0
-                if self._supersession_checker:
+                # C2R gate (fencing plan §7.2 #7/#8): backlog-sweeper
+                # dispatches skip the supersession + fact-link mutation
+                # passes entirely. ``promote_planned_facts`` ->
+                # ``update_fact_fields`` and ``set_fact_superseded``
+                # are both replacement-shaped writes that a recovery
+                # compaction must not perform. V1 takes the simplest
+                # path and skips ``check_and_link`` /
+                # ``check_and_supersede`` outright; any pure-insert
+                # ``store_fact_links`` write that would have followed
+                # is also skipped to keep the gate behavior uniform.
+                if self._supersession_checker and not disable_replacement_passes:
                     from ..types import CompactionLeaseLost
                     _full_guard = self._compaction_guard_kwargs(
                         operation_id, include_conversation_id=True,
