@@ -335,6 +335,7 @@ CREATE TABLE IF NOT EXISTS tag_summary_embeddings (
 CREATE INDEX IF NOT EXISTS idx_segments_primary_tag ON segments(primary_tag);
 CREATE INDEX IF NOT EXISTS idx_segments_created_at ON segments(created_at);
 CREATE INDEX IF NOT EXISTS idx_segments_conversation_id ON segments(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_tag_summaries_conv_updated ON tag_summaries(conversation_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_segment_tags_tag ON segment_tags(tag);
 CREATE INDEX IF NOT EXISTS idx_facts_subject ON facts(subject);
 CREATE INDEX IF NOT EXISTS idx_facts_verb ON facts(verb);

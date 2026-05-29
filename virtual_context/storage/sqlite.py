@@ -1318,6 +1318,10 @@ class SQLiteStore(ContextStore):
             conn.execute(
                 "ALTER TABLE tag_summaries ADD COLUMN covers_through_canonical_turn_id TEXT NOT NULL DEFAULT ''"
             )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tag_summaries_conv_updated "
+            "ON tag_summaries(conversation_id, updated_at DESC)"
+        )
         # Request capture persistence for proxy dashboard
         conn.executescript("""
 CREATE TABLE IF NOT EXISTS request_captures (
