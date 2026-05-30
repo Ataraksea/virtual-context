@@ -828,7 +828,18 @@ class PostgresStore(ContextStore):
         "vc_alias_post_commit_scope", default=None,
     )
 
-    def __init__(self, dsn: str) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        compaction_fence_mode: "CompactionFenceMode | None" = None,
+    ) -> None:
+        from ..core.compaction_fence import CompactionFenceMode as _CFM
+        # Resolve the runtime mode BEFORE the pool/schema setup so a
+        # bad ``VC_COMPACTION_FENCE_MODE`` value fails startup loudly,
+        # not after the store has already started serving writes in a
+        # weaker mode. Per fencing plan §9.0.
+        self._compaction_fence_mode = _CFM.resolve(compaction_fence_mode)
         self.dsn = dsn
         self.pool = ConnectionPool(
             self.dsn,

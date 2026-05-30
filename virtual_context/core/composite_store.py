@@ -43,7 +43,27 @@ class CompositeStore:
         fact_links: FactLinkStore,
         state: StateStore,
         search: SearchStore,
+        compaction_fence_mode: "CompactionFenceMode | None" = None,
     ) -> None:
+        from .compaction_fence import CompactionFenceMode as _CFM
+        # Resolve the runtime mode per fencing plan §9.0. If any
+        # delegate exposes its own ``_compaction_fence_mode`` we
+        # require it to match the composite's holder so cleanup and
+        # write paths cannot run on different mode sources.
+        self._compaction_fence_mode = _CFM.resolve(compaction_fence_mode)
+        for label, delegate in (
+            ("segments", segments), ("facts", facts),
+            ("fact_links", fact_links), ("state", state),
+            ("search", search),
+        ):
+            delegate_mode = getattr(delegate, "_compaction_fence_mode", None)
+            if delegate_mode is not None and delegate_mode != self._compaction_fence_mode:
+                raise ValueError(
+                    "CompositeStore compaction_fence_mode mismatch: "
+                    f"holder={self._compaction_fence_mode.value!r} but "
+                    f"{label} delegate={delegate_mode.value!r}. All "
+                    "delegates must share a single mode source."
+                )
         self._segments = segments
         self._facts = facts
         self._fact_links = fact_links

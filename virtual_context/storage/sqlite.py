@@ -677,7 +677,18 @@ def _merge_canonical_turn_rows(rows: list[CanonicalTurnRow]) -> dict[int, Canoni
 class SQLiteStore(ContextStore):
     """SQLite-based storage with tag-overlap queries and FTS5 search."""
 
-    def __init__(self, db_path: str | Path) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        compaction_fence_mode: "CompactionFenceMode | None" = None,
+    ) -> None:
+        from ..core.compaction_fence import CompactionFenceMode as _CFM
+        # Resolve the runtime mode BEFORE the schema/conn setup so a
+        # bad ``VC_COMPACTION_FENCE_MODE`` value fails startup loudly,
+        # not after the store has already started serving writes in a
+        # weaker mode. Per fencing plan §9.0.
+        self._compaction_fence_mode = _CFM.resolve(compaction_fence_mode)
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
