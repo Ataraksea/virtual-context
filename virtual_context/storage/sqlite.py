@@ -703,6 +703,30 @@ class SQLiteStore(ContextStore):
         self.search_config = None  # set by engine after construction
         self._ensure_schema()
 
+    def _enforce_or_observe_mismatch(
+        self, *, operation_id: str | None, write_site: str,
+    ) -> None:
+        """Mode-aware fence rejection. See PostgresStore equivalent
+        for the full contract (fencing plan §9.1-9.3). At ACTIVE
+        raises ``CompactionLeaseLost``; at OBSERVE logs
+        ``COMPACTION_FENCE_OBSERVED_MISMATCH`` without raising; at
+        OFF silently no-ops so the env-var-driven rollback is a
+        single-line configuration change.
+        """
+        mode = self._compaction_fence_mode
+        if mode.enforces:
+            from ..types import CompactionLeaseLost
+            raise CompactionLeaseLost(
+                operation_id=operation_id or "", write_site=write_site,
+            )
+        if mode.is_observe:
+            logger.warning(
+                "COMPACTION_FENCE_OBSERVED_MISMATCH operation_id=%s "
+                "write_site=%s mode=%s",
+                operation_id, write_site, mode.value,
+            )
+        # OFF: silent.
+
     def _get_conn(self) -> sqlite3.Connection:
         conn: sqlite3.Connection | None = getattr(self._local, "conn", None)
         if conn is None:
@@ -4460,18 +4484,40 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 (now, dead_operation_id, conversation_id, lifecycle_epoch),
             )
             fresh_takeover = (cur.rowcount or 0) > 0
-            # Tables that carry their own ``conversation_id`` column and
-            # so support the (operation_id, conversation_id)
-            # double-keyed DELETE. The P3-stamped facts rows are cleaned
-            # up here alongside segments / tag_summaries /
-            # tag_summary_embeddings + the segment_tool_outputs link
-            # table that was added in M0 with a conversation_id column.
-            # Per fencing plan §6.1.
+            # The four original cleanup tables (segments / facts /
+            # tag_summaries / tag_summary_embeddings) were active from
+            # M0 onward; their cleanup is NOT tier-gated because the
+            # ownership invariant they protect predates the fence
+            # rollout. The three new tables added in P4 are gated on
+            # the runtime mode per fencing plan §9.1-9.3:
+            #
+            #   - ACTIVE: DELETE rows owned by the dead operation.
+            #   - OBSERVE: log a would-delete count without executing
+            #     the DELETE, so cloud can verify the cleanup would
+            #     fire correctly before enabling enforcement.
+            #   - OFF: skip silently. The new-table rows leak until
+            #     the mode is flipped, which is acceptable during a
+            #     kill-switch window because the new tables are also
+            #     not being written under OFF.
+            _mode = self._compaction_fence_mode
             for table in (
                 "segments", "facts",
                 "tag_summaries", "tag_summary_embeddings",
                 "segment_tool_outputs",
             ):
+                if table == "segment_tool_outputs" and not _mode.enforces:
+                    if _mode.is_observe:
+                        _row = conn.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE operation_id = ? AND conversation_id = ?",
+                            (dead_operation_id, conversation_id),
+                        ).fetchone()
+                        logger.warning(
+                            "COMPACTION_FENCE_CLEANUP_OBSERVED "
+                            "table=%s operation_id=%s would_delete=%s",
+                            table, dead_operation_id, int(_row[0]) if _row else 0,
+                        )
+                    continue
                 conn.execute(
                     f"DELETE FROM {table} "
                     f"WHERE operation_id = ? AND conversation_id = ?",
@@ -4481,8 +4527,22 @@ CREATE TABLE IF NOT EXISTS request_captures (
             # operation_id alone. ``segment_chunks`` keys to
             # ``segment_ref`` and ``fact_links`` keys to endpoint fact
             # ids, so the operation_id stamp is the only cleanup join
-            # key. Per fencing plan §6.1 P1-4 fold.
+            # key. Per fencing plan §6.1 P1-4 fold. Both are new in
+            # P4 so the tier gate applies (see comment block above).
             for table in ("segment_chunks", "fact_links"):
+                if not _mode.enforces:
+                    if _mode.is_observe:
+                        _row = conn.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE operation_id = ?",
+                            (dead_operation_id,),
+                        ).fetchone()
+                        logger.warning(
+                            "COMPACTION_FENCE_CLEANUP_OBSERVED "
+                            "table=%s operation_id=%s would_delete=%s",
+                            table, dead_operation_id, int(_row[0]) if _row else 0,
+                        )
+                    continue
                 conn.execute(
                     f"DELETE FROM {table} WHERE operation_id = ?",
                     (dead_operation_id,),

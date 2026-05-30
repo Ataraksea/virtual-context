@@ -14,12 +14,10 @@ Per fencing plan §9.0 + §9.6:
   does NOT affect existing stores; only fresh construction observes
   the new value. Cleanup and write paths read the same holder.
 
-The behavioral tier gates (T7.1 / T7.2 / T7.3) -- runtime branching
-on ``self._compaction_fence_mode`` inside the per-write fence and
-cleanup paths -- are scheduled for a follow-up commit so the
-construction holder and the env-parse contract land independently
-and so the behavioral wiring can be reviewed against a tighter
-patch.
+The cleanup tier gates (T7.1 / T7.2 / T7.3) and the dormant
+``_enforce_or_observe_mismatch`` helper live in this patch. The
+per-write call sites that will invoke the helper are scheduled for a
+follow-up commit so those replacements can be reviewed separately.
 
 Tests use ``monkeypatch`` to scope every ``VC_COMPACTION_FENCE_MODE``
 manipulation to a single test case, restoring the prior value at
@@ -189,6 +187,283 @@ class TestModePropertySurface:
 # different mode holder than the composite's, construction fails so
 # cleanup and write paths cannot run on divergent sources.
 # ---------------------------------------------------------------------------
+
+
+class _SeedHelper:
+    """Compact seeding for the cleanup-mode tests below. Mirrors the
+    minimal subset of test_compaction_cleanup_extension's helpers so
+    these tests don't share fixtures across modules.
+    """
+
+    @staticmethod
+    def seed(store: SQLiteStore, *, conv: str, dead_op: str) -> None:
+        from virtual_context.core.canonical_turns import utcnow_iso
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO conversation_lifecycle "
+            "(conversation_id, generation, deleted, updated_at) "
+            "VALUES (?, 0, 0, ?)",
+            (conv, now),
+        )
+        # compaction_operation has an FK to conversations(conversation_id)
+        # in the SQLite schema -- seed the parent row before the op.
+        conn.execute(
+            "INSERT OR IGNORE INTO conversations "
+            "(conversation_id, tenant_id, phase, lifecycle_epoch, "
+            " created_at, updated_at) "
+            "VALUES (?, 't', 'active', 1, ?, ?)",
+            (conv, now, now),
+        )
+        conn.execute(
+            """INSERT INTO compaction_operation
+               (operation_id, conversation_id, lifecycle_epoch,
+                phase_index, phase_count, phase_name, status,
+                started_at, heartbeat_ts, owner_worker_id, created_at)
+               VALUES (?, ?, 1, 0, 7, 'starting', 'running',
+                       ?, ?, 'w', ?)""",
+            (dead_op, conv, now, now, now),
+        )
+        # Seed one row per new-table that the tier gate touches:
+        # segment_chunks, segment_tool_outputs, fact_links.
+        # segment_chunks rows are removed when the parent segment is
+        # deleted. To isolate the tier-gate effect on segment_chunks,
+        # we seed the parent segment with operation_id=NULL so the
+        # (always-on) segments cleanup does
+        # NOT cascade-delete the child chunk rows. The dead op still
+        # owns the segment_chunks row via its own operation_id stamp
+        # so the tier-gate logic decides whether to DELETE it.
+        seg_ref = f"seg-{dead_op[:6]}"
+        conn.execute(
+            """INSERT INTO segments
+               (ref, conversation_id, summary, full_text, primary_tag,
+                compaction_model, created_at, start_timestamp,
+                end_timestamp, operation_id)
+               VALUES (?, ?, 's', 'f', 't', 'passthrough', ?, ?, ?,
+                       NULL)""",
+            (seg_ref, conv, now, now, now),
+        )
+        conn.execute(
+            """INSERT INTO segment_chunks
+               (segment_ref, chunk_index, text, embedding_json,
+                operation_id)
+               VALUES (?, 0, 'x', '[]', ?)""",
+            (seg_ref, dead_op),
+        )
+        conn.execute(
+            """INSERT INTO segment_tool_outputs
+               (conversation_id, segment_ref, tool_output_ref,
+                operation_id)
+               VALUES (?, ?, ?, ?)""",
+            (conv, seg_ref, f"tool-{dead_op[:6]}", dead_op),
+        )
+        # fact_links needs endpoint facts to satisfy the FK.
+        for fid in ("src", "tgt"):
+            conn.execute(
+                """INSERT OR IGNORE INTO facts
+                   (id, subject, verb, object, status, what,
+                    conversation_id, mentioned_at, session_date,
+                    operation_id)
+                   VALUES (?, 's', 'v', 'o', 'active', '', ?, ?, ?,
+                           NULL)""",
+                (fid, conv, now, now),
+            )
+        conn.execute(
+            """INSERT INTO fact_links
+               (id, source_fact_id, target_fact_id, relation_type,
+                confidence, context, created_at, created_by,
+                operation_id)
+               VALUES (?, 'src', 'tgt', 'r', 1.0, '', ?, 'compaction',
+                       ?)""",
+            (f"link-{dead_op[:6]}", now, dead_op),
+        )
+        conn.commit()
+
+    @staticmethod
+    def count(store: SQLiteStore, *, table: str, dead_op: str) -> int:
+        conn = store._get_conn()
+        if table == "segment_tool_outputs":
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE operation_id = ?",
+                (dead_op,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE operation_id = ?",
+                (dead_op,),
+            ).fetchone()
+        return int(row[0])
+
+
+class TestT71_OffModeSkipsNewTableCleanup:
+    """T7.1: at OFF tier, ``cleanup_abandoned_compaction`` leaves the
+    three new tables (segment_chunks, segment_tool_outputs,
+    fact_links) untouched. The pre-P4 cleanup tables (segments,
+    facts, tag_summaries, tag_summary_embeddings) still execute --
+    they were active from M0 and the rollout discipline applies only
+    to the new surface.
+    """
+
+    def test_new_tables_not_deleted_at_off(self, tmp_path, caplog):
+        store = SQLiteStore(
+            tmp_path / "off.db",
+            compaction_fence_mode=CompactionFenceMode.OFF,
+        )
+        conv, dead = "conv-off", "op-off"
+        _SeedHelper.seed(store, conv=conv, dead_op=dead)
+        with caplog.at_level("WARNING"):
+            store.cleanup_abandoned_compaction(
+                conversation_id=conv,
+                dead_operation_id=dead,
+                new_operation_id="op-new-off",
+                lifecycle_epoch=1, worker_id="w", phase_count=7,
+            )
+        # New-table rows survive at OFF.
+        for table in ("segment_chunks", "segment_tool_outputs", "fact_links"):
+            assert _SeedHelper.count(store, table=table, dead_op=dead) == 1, (
+                f"OFF mode: expected {table} dead-op row to survive"
+            )
+        assert not [
+            r for r in caplog.records
+            if "COMPACTION_FENCE_CLEANUP_OBSERVED" in r.message
+        ], "OFF mode must skip new-table cleanup silently"
+
+
+class TestT72_ObserveModeLogsButDoesNotDelete:
+    """T7.2: at OBSERVE tier, ``cleanup_abandoned_compaction`` logs
+    a ``COMPACTION_FENCE_CLEANUP_OBSERVED`` line per new-table
+    candidate without executing the DELETE.
+    """
+
+    def test_observe_logs_would_delete_and_skips(self, tmp_path, caplog):
+        store = SQLiteStore(
+            tmp_path / "obs.db",
+            compaction_fence_mode=CompactionFenceMode.OBSERVE,
+        )
+        conv, dead = "conv-obs", "op-obs"
+        _SeedHelper.seed(store, conv=conv, dead_op=dead)
+        with caplog.at_level("WARNING"):
+            store.cleanup_abandoned_compaction(
+                conversation_id=conv,
+                dead_operation_id=dead,
+                new_operation_id="op-new-obs",
+                lifecycle_epoch=1, worker_id="w", phase_count=7,
+            )
+        # Rows still there.
+        for table in ("segment_chunks", "segment_tool_outputs", "fact_links"):
+            assert _SeedHelper.count(store, table=table, dead_op=dead) == 1, (
+                f"OBSERVE mode: expected {table} dead-op row to survive"
+            )
+        # Log lines fired with the right shape.
+        observed = [
+            r for r in caplog.records
+            if "COMPACTION_FENCE_CLEANUP_OBSERVED" in r.message
+        ]
+        assert len(observed) == 3, (
+            "OBSERVE mode must log exactly one would-delete line per new table"
+        )
+        seen: set[str] = set()
+        for record in observed:
+            assert record.levelname == "WARNING"
+            for table in (
+                "segment_chunks", "segment_tool_outputs", "fact_links",
+            ):
+                if f"table={table}" in record.message:
+                    assert table not in seen, (
+                        f"OBSERVE log duplicated table={table}"
+                    )
+                    seen.add(table)
+                    assert f"operation_id={dead}" in record.message
+                    assert "would_delete=1" in record.message
+                    break
+            else:
+                pytest.fail(
+                    f"OBSERVE log had unexpected table: {record.message}"
+                )
+        assert seen == {
+            "segment_chunks", "segment_tool_outputs", "fact_links",
+        }
+
+
+class TestT73_ActiveModeDeletes:
+    """T7.3: at ACTIVE tier, ``cleanup_abandoned_compaction``
+    executes the new-table DELETEs (the current P4 behavior).
+    """
+
+    def test_active_deletes_new_table_rows(self, tmp_path):
+        store = SQLiteStore(
+            tmp_path / "act.db",
+            compaction_fence_mode=CompactionFenceMode.ACTIVE,
+        )
+        conv, dead = "conv-act", "op-act"
+        _SeedHelper.seed(store, conv=conv, dead_op=dead)
+        store.cleanup_abandoned_compaction(
+            conversation_id=conv,
+            dead_operation_id=dead,
+            new_operation_id="op-new-act",
+            lifecycle_epoch=1, worker_id="w", phase_count=7,
+        )
+        for table in ("segment_chunks", "segment_tool_outputs", "fact_links"):
+            assert _SeedHelper.count(store, table=table, dead_op=dead) == 0, (
+                f"ACTIVE mode: expected {table} dead-op row to be deleted"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Mode-aware fence rejection helper: per-write raises are gated on
+# ``_enforce_or_observe_mismatch`` per fencing plan §9.1-9.3. This
+# commit only ships the helper; the per-write call sites are wired
+# in the V2 P7-behavioral commit. Tests below cover the helper's
+# contract so the V2 wiring lands against a tight surface.
+# ---------------------------------------------------------------------------
+
+
+class TestEnforceOrObserveHelper:
+    def test_active_raises_compaction_lease_lost(self, tmp_path):
+        from virtual_context.types import CompactionLeaseLost
+        store = SQLiteStore(
+            tmp_path / "h-act.db",
+            compaction_fence_mode=CompactionFenceMode.ACTIVE,
+        )
+        with pytest.raises(CompactionLeaseLost) as exc:
+            store._enforce_or_observe_mismatch(
+                operation_id="op-1", write_site="store_facts",
+            )
+        assert exc.value.write_site == "store_facts"
+        assert exc.value.operation_id == "op-1"
+
+    def test_observe_logs_without_raising(self, tmp_path, caplog):
+        store = SQLiteStore(
+            tmp_path / "h-obs.db",
+            compaction_fence_mode=CompactionFenceMode.OBSERVE,
+        )
+        with caplog.at_level("WARNING"):
+            store._enforce_or_observe_mismatch(
+                operation_id="op-2", write_site="set_fact_superseded",
+            )
+        msgs = [
+            r.message for r in caplog.records
+            if "COMPACTION_FENCE_OBSERVED_MISMATCH" in r.message
+        ]
+        assert msgs, "OBSERVE mode must log the mismatch"
+        assert "operation_id=op-2" in msgs[0]
+        assert "write_site=set_fact_superseded" in msgs[0]
+        assert "mode=observe" in msgs[0]
+
+    def test_off_silent_no_raise_no_log(self, tmp_path, caplog):
+        store = SQLiteStore(
+            tmp_path / "h-off.db",
+            compaction_fence_mode=CompactionFenceMode.OFF,
+        )
+        with caplog.at_level("WARNING"):
+            store._enforce_or_observe_mismatch(
+                operation_id="op-3", write_site="update_fact_fields",
+            )
+        msgs = [
+            r.message for r in caplog.records
+            if "COMPACTION_FENCE" in r.message
+        ]
+        assert not msgs, "OFF mode must be silent"
 
 
 class TestCompositeStoreModeMismatch:

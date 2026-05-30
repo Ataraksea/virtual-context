@@ -29,10 +29,19 @@ from pathlib import Path
 import pytest
 
 from virtual_context.core.canonical_turns import utcnow_iso
+from virtual_context.core.compaction_fence import CompactionFenceMode
 from virtual_context.storage.sqlite import SQLiteStore
 
 
 _EARLIER = "2026-01-01T00:00:00+00:00"
+
+
+def _make_active_store(path) -> SQLiteStore:
+    """Cleanup-extension tests pin the store to ACTIVE mode so the
+    new-table DELETEs execute. The default OFF mode skips those
+    DELETEs per the P7 tier-rollout discipline (fencing plan §9.1).
+    """
+    return SQLiteStore(path, compaction_fence_mode=CompactionFenceMode.ACTIVE)
 
 
 def _seed_op_row(
@@ -207,7 +216,7 @@ def _counts(
 
 class TestT41_ScopedDeleteAcrossAllSevenTables:
     def test_dead_op_rows_deleted_from_all_seven_tables(self, tmp_path: Path):
-        store = SQLiteStore(tmp_path / "t41.db")
+        store = _make_active_store(tmp_path / "t41.db")
         store.upsert_conversation(tenant_id="t", conversation_id="conv-1")
         _seed_op_row(store, conv="conv-1", op_id="dead-op", status="running",
                      worker_id="dead-worker")
@@ -255,7 +264,7 @@ class TestT41_ScopedDeleteAcrossAllSevenTables:
 
 class TestT42_CleanupIsIdempotent:
     def test_second_run_no_error_no_extra_deletes(self, tmp_path: Path):
-        store = SQLiteStore(tmp_path / "t42.db")
+        store = _make_active_store(tmp_path / "t42.db")
         store.upsert_conversation(tenant_id="t", conversation_id="conv-2")
         _seed_op_row(store, conv="conv-2", op_id="dead-op", status="running")
         _seed_fact_link_endpoints(store, conv="conv-2")
@@ -303,7 +312,7 @@ class TestT42_CleanupIsIdempotent:
 
 class TestT43_LegacyNullOpIdRowsProtected:
     def test_null_operation_id_rows_not_touched(self, tmp_path: Path):
-        store = SQLiteStore(tmp_path / "t43.db")
+        store = _make_active_store(tmp_path / "t43.db")
         store.upsert_conversation(tenant_id="t", conversation_id="conv-3")
         _seed_op_row(store, conv="conv-3", op_id="dead-op", status="running")
         _seed_fact_link_endpoints(store, conv="conv-3")
@@ -354,7 +363,7 @@ class TestT43_LegacyNullOpIdRowsProtected:
 
 class TestT44_OtherOperationRowsProtected:
     def test_other_op_rows_not_touched(self, tmp_path: Path):
-        store = SQLiteStore(tmp_path / "t44.db")
+        store = _make_active_store(tmp_path / "t44.db")
         store.upsert_conversation(tenant_id="t", conversation_id="conv-4")
         _seed_op_row(store, conv="conv-4", op_id="dead-op", status="running")
         _seed_op_row(store, conv="conv-4", op_id="other-op",
