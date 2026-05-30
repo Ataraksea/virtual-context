@@ -2170,11 +2170,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
+                    # ROLLBACK fires at every tier so the open
+                    # BEGIN IMMEDIATE transaction is closed even when
+                    # the helper does not raise (OBSERVE / OFF).
+                    # Without this the connection would carry an
+                    # open txn into the next caller.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="store_segment",
                     )
+                    return segment.ref
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(
@@ -5183,11 +5189,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
+                    # Unconditional ROLLBACK -- see store_segment
+                    # comment for the open-transaction rationale.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="save_tag_summary",
                     )
+                    return
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(
@@ -5362,7 +5371,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         plan §5.4 P1-3 fold. Inserted rows carry operation_id so
         cleanup_abandoned_compaction can DELETE them on takeover.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
             conversation_id=conversation_id,
@@ -5393,10 +5401,16 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 ).fetchone()
                 if probe is None:
-                    raise CompactionLeaseLost(
+                    # Close the BEGIN IMMEDIATE before returning so
+                    # the connection does not leak an open
+                    # transaction at OBSERVE / OFF. At ACTIVE the
+                    # helper raises after the rollback.
+                    conn.rollback()
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="store_chunk_embeddings",
                     )
+                    return
             conn.execute("DELETE FROM segment_chunks WHERE segment_ref = ?", (segment_ref,))
             for chunk in chunks:
                 if guard_all:
@@ -6374,7 +6388,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         """
         if not canonical_turn_ids:
             return 0
-        from ..types import CompactionLeaseLost
 
         guard_all = (
             operation_id is not None
@@ -6418,10 +6431,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             self._commit_if_unlocked(conn)
             if (cur.rowcount or 0) == 0:
-                raise CompactionLeaseLost(
+                self._enforce_or_observe_mismatch(
                     operation_id=operation_id,
                     write_site="mark_canonical_turns_compacted",
                 )
+                return 0
             return int(cur.rowcount)
         else:
             cur = conn.execute(
@@ -6643,11 +6657,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         ),
                     )
                     if (cur.rowcount or 0) == 0:
-                        conn.execute("ROLLBACK")
-                        raise CompactionLeaseLost(
+                        if self._compaction_fence_mode.enforces:
+                            conn.execute("ROLLBACK")
+                            self._enforce_or_observe_mismatch(
+                                operation_id=operation_id,
+                                write_site="store_facts",
+                            )
+                            return count
+                        # OBSERVE / OFF: log (OBSERVE) or silent (OFF)
+                        # then skip this fact and continue.
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="store_facts",
                         )
+                        continue
                 else:
                     # Legacy unconditional path — existing callers and
                     # non-compaction write sites.
@@ -6831,6 +6854,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # ``replace_facts_for_segment`` has a pre-INSERT DELETE that
+        # opens a data-loss window: at OBSERVE/OFF a per-fact INSERT
+        # mismatch would commit the DELETE without a matching INSERT
+        # and leave the segment factless. Downgrade to the legacy
+        # unguarded path at every tier below ACTIVE so the DELETE and
+        # INSERTs run atomically without the per-fact guard. The
+        # operation_id stamp is dropped at OBSERVE for this method
+        # specifically; documented spec deviation per fencing plan
+        # §9.2 in exchange for data-integrity safety. Per Codex
+        # P7-behavioral pt.2 finding.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
 
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -6848,11 +6883,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
                 ).fetchone()
                 if row is None:
+                    # Unconditional ROLLBACK so the BEGIN IMMEDIATE
+                    # transaction is closed at every tier before the
+                    # function returns. At ACTIVE the helper raises
+                    # after the rollback (matches pre-P7 behavior);
+                    # at OBSERVE/OFF the helper logs/silent and the
+                    # early return propagates the no-op result.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="replace_facts_for_segment",
                     )
+                    return (0, 0)
 
             # DELETE existing facts (and their tag links) for this segment.
             conn.execute(
@@ -6899,11 +6941,18 @@ CREATE TABLE IF NOT EXISTS request_captures (
                         ),
                     )
                     if (cur.rowcount or 0) == 0:
+                        # Only reached when ``guard_all`` is True,
+                        # which now only happens at ACTIVE tier (the
+                        # gate at the top of this method downgrades
+                        # OBSERVE/OFF callers to the legacy path to
+                        # close the DELETE-then-mismatch data-loss
+                        # window). Roll back the DELETE then raise.
                         conn.execute("ROLLBACK")
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="replace_facts_for_segment",
                         )
+                        return (0, 0)
                 else:
                     conn.execute(
                         """INSERT OR REPLACE INTO facts
@@ -7005,7 +7054,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         the active op. Blocks cross-conversation supersession pointers
         per fencing plan §4.3 P1-8 fold.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -7040,11 +7088,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 ),
             )
             if (cur.rowcount or 0) == 0:
-                conn.rollback()
-                raise CompactionLeaseLost(
+                if self._compaction_fence_mode.enforces:
+                    conn.rollback()
+                self._enforce_or_observe_mismatch(
                     operation_id=operation_id,
                     write_site="set_fact_superseded",
                 )
+                return
         else:
             conn.execute(
                 "UPDATE facts SET superseded_by = ? WHERE id = ?",
@@ -7069,7 +7119,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         the same conversation as the active op (matched on the guard
         triple at status='running').
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -7100,11 +7149,13 @@ CREATE TABLE IF NOT EXISTS request_captures (
                 ),
             )
             if (cur.rowcount or 0) == 0:
-                conn.rollback()
-                raise CompactionLeaseLost(
+                if self._compaction_fence_mode.enforces:
+                    conn.rollback()
+                self._enforce_or_observe_mismatch(
                     operation_id=operation_id,
                     write_site="update_fact_fields",
                 )
+                return
         else:
             conn.execute(
                 "UPDATE facts SET verb = ?, object = ?, status = ?, what = ? WHERE id = ?",
@@ -7170,7 +7221,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         operation_id so cleanup_abandoned_compaction can DELETE the
         op-owned rows on takeover. Per fencing plan §4.3 P1-7 fold.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
             conversation_id=conversation_id,
@@ -7229,10 +7279,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                             (link.id,),
                         ).fetchone()
                         if pre_existing is None:
-                            raise CompactionLeaseLost(
+                            # Real guard rejection (not an idempotent
+                            # ON CONFLICT skip). Mode-aware: raise at
+                            # ACTIVE, log at OBSERVE, silent at OFF.
+                            self._enforce_or_observe_mismatch(
                                 operation_id=operation_id,
                                 write_site="store_fact_links",
                             )
+                            continue
                 else:
                     conn.execute(
                         """INSERT OR REPLACE INTO fact_links
@@ -7559,7 +7613,6 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id. Inserted row carries operation_id for
         cleanup-on-takeover.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -7600,10 +7653,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     (conversation_id, segment_ref, tool_output_ref),
                 ).fetchone()
                 if pre_existing is None:
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="link_segment_tool_output",
                     )
+                    return
         else:
             conn.execute(
                 """INSERT OR IGNORE INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
@@ -7901,11 +7955,14 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
+                    # Unconditional ROLLBACK so the open BEGIN
+                    # IMMEDIATE transaction is closed at every tier.
                     conn.execute("ROLLBACK")
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="store_tag_summary_embedding",
                     )
+                    return
             else:
                 # Legacy unconditional path — existing callers and test harnesses.
                 conn.execute(

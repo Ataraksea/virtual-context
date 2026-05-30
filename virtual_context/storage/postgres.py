@@ -1775,7 +1775,6 @@ class PostgresStore(ContextStore):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> str:
-        from ..types import CompactionLeaseLost
         with self.pool.connection() as conn:
             primary_tag = segment.primary_tag
             summary_text = segment.summary
@@ -1847,10 +1846,11 @@ class PostgresStore(ContextStore):
                         ),
                     )
                     if (cur.rowcount or 0) == 0:
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="store_segment",
                         )
+                        return segment.ref
                 else:
                     # Legacy unconditional path — existing callers and test harnesses.
                     conn.execute(
@@ -4764,8 +4764,6 @@ class PostgresStore(ContextStore):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> None:
-        from ..types import CompactionLeaseLost
-
         guard_all = (
             operation_id is not None
             and owner_worker_id is not None
@@ -4822,10 +4820,11 @@ class PostgresStore(ContextStore):
                         ),
                     )
                     if (cur.rowcount or 0) == 0:
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="save_tag_summary",
                         )
+                        return
                 else:
                     # Legacy unconditional path — existing callers and test harnesses.
                     conn.execute(
@@ -5068,7 +5067,6 @@ class PostgresStore(ContextStore):
         segment ownership is validated via a JOIN through segments
         rather than trusting the caller-supplied conversation_id.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
             conversation_id=conversation_id,
@@ -5101,10 +5099,11 @@ class PostgresStore(ContextStore):
                         ),
                     ).fetchone()
                     if probe is None:
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="store_chunk_embeddings",
                         )
+                        return
                 conn.execute("DELETE FROM segment_chunks WHERE segment_ref = %s", (segment_ref,))
                 for chunk in chunks:
                     if guard_all:
@@ -5305,7 +5304,6 @@ class PostgresStore(ContextStore):
         are supplied: the INSERT only fires if the active op matches.
         Inserted row carries operation_id for cleanup-on-takeover.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -5346,10 +5344,11 @@ class PostgresStore(ContextStore):
                         (conversation_id, segment_ref, tool_output_ref),
                     ).fetchone()
                     if pre_existing is None:
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="link_segment_tool_output",
                         )
+                        return
             else:
                 conn.execute(
                     """INSERT INTO segment_tool_outputs (conversation_id, segment_ref, tool_output_ref)
@@ -6434,7 +6433,6 @@ class PostgresStore(ContextStore):
         """
         if not canonical_turn_ids:
             return 0
-        from ..types import CompactionLeaseLost
 
         guard_all = (
             operation_id is not None
@@ -6476,10 +6474,11 @@ class PostgresStore(ContextStore):
                     ),
                 )
                 if (rows.rowcount or 0) == 0:
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="mark_canonical_turns_compacted",
                     )
+                    return 0
                 return int(rows.rowcount)
             else:
                 rows = conn.execute(
@@ -6622,8 +6621,6 @@ class PostgresStore(ContextStore):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> None:
-        from ..types import CompactionLeaseLost
-
         guard_all = (
             operation_id is not None
             and owner_worker_id is not None
@@ -6658,10 +6655,11 @@ class PostgresStore(ContextStore):
                         ),
                     )
                     if (cur.rowcount or 0) == 0:
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="store_tag_summary_embedding",
                         )
+                        return
                 else:
                     # Legacy unconditional path — existing callers and test harnesses.
                     conn.execute(
@@ -6728,7 +6726,6 @@ class PostgresStore(ContextStore):
         owner_worker_id: str | None = None,
         lifecycle_epoch: int | None = None,
     ) -> int:
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -6788,10 +6785,11 @@ class PostgresStore(ContextStore):
                             ),
                         )
                         if (cur.rowcount or 0) == 0:
-                            raise CompactionLeaseLost(
+                            self._enforce_or_observe_mismatch(
                                 operation_id=operation_id,
                                 write_site="store_facts",
                             )
+                            continue
                     else:
                         # Legacy unconditional path — existing callers and
                         # non-compaction write sites.
@@ -6914,7 +6912,6 @@ class PostgresStore(ContextStore):
         When called without guard kwargs (legacy / non-compaction path),
         behaviour is unchanged: unconditional DELETE + INSERT.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -6924,6 +6921,18 @@ class PostgresStore(ContextStore):
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # ``replace_facts_for_segment`` has a pre-INSERT DELETE that
+        # opens a data-loss window: at OBSERVE/OFF a per-fact INSERT
+        # mismatch would commit the DELETE without a matching INSERT
+        # and leave the segment factless. Downgrade to the legacy
+        # unguarded path at every tier below ACTIVE so the DELETE and
+        # INSERTs run atomically without the per-fact guard. The
+        # operation_id stamp is dropped at OBSERVE for this method
+        # specifically; documented spec deviation per fencing plan
+        # §9.2 in exchange for data-integrity safety. Per Codex
+        # P7-behavioral pt.2 finding.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
 
         with self.pool.connection() as conn:
             with conn.transaction():
@@ -6939,10 +6948,11 @@ class PostgresStore(ContextStore):
                         (operation_id, conversation_id, owner_worker_id, lifecycle_epoch),
                     ).fetchone()
                     if row is None:
-                        raise CompactionLeaseLost(
+                        self._enforce_or_observe_mismatch(
                             operation_id=operation_id,
                             write_site="replace_facts_for_segment",
                         )
+                        return (0, 0)
 
                 result = conn.execute(
                     "DELETE FROM facts WHERE conversation_id = %s AND segment_ref = %s",
@@ -6988,10 +6998,19 @@ class PostgresStore(ContextStore):
                             ),
                         )
                         if (cur.rowcount or 0) == 0:
-                            raise CompactionLeaseLost(
+                            # Only reached when ``guard_all`` is True,
+                            # which now only happens at ACTIVE tier
+                            # (the gate at the top of this method
+                            # downgrades OBSERVE/OFF callers to the
+                            # legacy path to close the
+                            # DELETE-then-mismatch data-loss window).
+                            # The helper raises and the surrounding
+                            # ``with conn.transaction()`` rolls back.
+                            self._enforce_or_observe_mismatch(
                                 operation_id=operation_id,
                                 write_site="replace_facts_for_segment",
                             )
+                            continue
                     else:
                         conn.execute(
                             """INSERT INTO facts
@@ -7065,7 +7084,6 @@ class PostgresStore(ContextStore):
         active op. This blocks cross-conversation supersession pointers
         per fencing plan §4.2 P1-7 / §4.3 P1-8 fold.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -7100,10 +7118,11 @@ class PostgresStore(ContextStore):
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="set_fact_superseded",
                     )
+                    return
             else:
                 conn.execute(
                     "UPDATE facts SET superseded_by = %s WHERE id = %s",
@@ -7126,7 +7145,6 @@ class PostgresStore(ContextStore):
         supplied: the UPDATE only fires if the target fact belongs to
         the same conversation as the active op.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
         )
@@ -7157,10 +7175,11 @@ class PostgresStore(ContextStore):
                     ),
                 )
                 if (cur.rowcount or 0) == 0:
-                    raise CompactionLeaseLost(
+                    self._enforce_or_observe_mismatch(
                         operation_id=operation_id,
                         write_site="update_fact_fields",
                     )
+                    return
             else:
                 conn.execute(
                     "UPDATE facts SET verb = %s, object = %s, status = %s, what = %s WHERE id = %s",
@@ -7229,7 +7248,6 @@ class PostgresStore(ContextStore):
         §5.3 P1-3 fold. The inserted row carries the active operation
         id so cleanup_abandoned_compaction can DELETE it on takeover.
         """
-        from ..types import CompactionLeaseLost
         _validate_compaction_guard_kwargs(
             operation_id, owner_worker_id, lifecycle_epoch,
             conversation_id=conversation_id,
@@ -7287,10 +7305,11 @@ class PostgresStore(ContextStore):
                                 (link.id,),
                             ).fetchone()
                             if pre_existing is None:
-                                raise CompactionLeaseLost(
+                                self._enforce_or_observe_mismatch(
                                     operation_id=operation_id,
                                     write_site="store_fact_links",
                                 )
+                                continue
                     else:
                         conn.execute(
                             """INSERT INTO fact_links (id, source_fact_id, target_fact_id, relation_type,

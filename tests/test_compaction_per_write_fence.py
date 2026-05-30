@@ -53,9 +53,16 @@ from virtual_context.types import (
 
 
 def _make_store() -> SQLiteStore:
+    """Per-write fence tests pin ACTIVE mode so the helper raises
+    CompactionLeaseLost on guard mismatch. The default OFF mode would
+    silently absorb the rejection per the P7 rollout discipline."""
+    from virtual_context.core.compaction_fence import CompactionFenceMode
     handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     handle.close()
-    return SQLiteStore(handle.name)
+    return SQLiteStore(
+        handle.name,
+        compaction_fence_mode=CompactionFenceMode.ACTIVE,
+    )
 
 
 _TS = "2026-05-29T00:00:00+00:00"

@@ -45,8 +45,12 @@ _TS = "2026-05-29T00:00:00+00:00"
 
 @pytest.fixture(scope="module")
 def store():
+    from virtual_context.core.compaction_fence import CompactionFenceMode
     from virtual_context.storage.postgres import PostgresStore
-    s = PostgresStore(os.environ["DATABASE_URL"])
+    s = PostgresStore(
+        os.environ["DATABASE_URL"],
+        compaction_fence_mode=CompactionFenceMode.ACTIVE,
+    )
     yield s
 
 

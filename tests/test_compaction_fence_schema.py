@@ -27,12 +27,18 @@ from virtual_context.types import ChunkEmbedding, FactLink
 
 
 def _make_store():
-    """Build a fresh SQLiteStore on a temp file. The file is held via the
-    store's internal pool; cleanup happens on garbage collection.
+    """Build a fresh SQLiteStore on a temp file. Pins ACTIVE mode so
+    the M0 fenced-call smoke tests see the per-write fence's raise
+    behavior (default OFF would silently absorb the rejection per the
+    P7 rollout discipline).
     """
+    from virtual_context.core.compaction_fence import CompactionFenceMode
     handle = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     handle.close()
-    return SQLiteStore(handle.name)
+    return SQLiteStore(
+        handle.name,
+        compaction_fence_mode=CompactionFenceMode.ACTIVE,
+    )
 
 
 def _columns(store: SQLiteStore, table: str) -> set[str]:

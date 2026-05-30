@@ -14,10 +14,9 @@ Per fencing plan §9.0 + §9.6:
   does NOT affect existing stores; only fresh construction observes
   the new value. Cleanup and write paths read the same holder.
 
-The cleanup tier gates (T7.1 / T7.2 / T7.3) and the dormant
-``_enforce_or_observe_mismatch`` helper live in this patch. The
-per-write call sites that will invoke the helper are scheduled for a
-follow-up commit so those replacements can be reviewed separately.
+The cleanup tier gates (T7.1 / T7.2 / T7.3), the
+``_enforce_or_observe_mismatch`` helper, and the representative
+per-write mode matrix live in this file.
 
 Tests use ``monkeypatch`` to scope every ``VC_COMPACTION_FENCE_MODE``
 manipulation to a single test case, restoring the prior value at
@@ -156,9 +155,7 @@ class TestT76_StoreLifetimePin:
 
 # ---------------------------------------------------------------------------
 # Holder property surface: enforces / stamps_operation_id flags map
-# the tier semantics consistently. The behavioral wiring that READS
-# these will land in the follow-up commit; verifying the holder's
-# contract now keeps that follow-up small.
+# the tier semantics consistently for cleanup and per-write paths.
 # ---------------------------------------------------------------------------
 
 
@@ -411,10 +408,9 @@ class TestT73_ActiveModeDeletes:
 
 # ---------------------------------------------------------------------------
 # Mode-aware fence rejection helper: per-write raises are gated on
-# ``_enforce_or_observe_mismatch`` per fencing plan §9.1-9.3. This
-# commit only ships the helper; the per-write call sites are wired
-# in the V2 P7-behavioral commit. Tests below cover the helper's
-# contract so the V2 wiring lands against a tight surface.
+# ``_enforce_or_observe_mismatch`` per fencing plan §9.1-9.3. The
+# tests below cover the helper contract and verify that representative
+# storage calls route mismatches through it.
 # ---------------------------------------------------------------------------
 
 
@@ -464,6 +460,239 @@ class TestEnforceOrObserveHelper:
             if "COMPACTION_FENCE" in r.message
         ]
         assert not msgs, "OFF mode must be silent"
+
+
+class TestPerWriteFenceModeMatrix:
+    """Per-write fence raise sites are now mode-aware via the helper.
+    Verify the same guarded write at all three tiers:
+
+    * ACTIVE: rejects via ``CompactionLeaseLost`` (existing behavior).
+    * OBSERVE: logs ``COMPACTION_FENCE_OBSERVED_MISMATCH`` and the
+      method returns normally without raising; the write does NOT
+      land because the guard SQL produced rowcount=0.
+    * OFF: silent no-op; the write does NOT land for the same reason.
+
+    The "write does not land at OFF" semantic is the V1 kill-switch
+    -- the documented spec target ("OFF = full legacy behavior with
+    unguarded SQL") requires per-method guard_all bypass refactoring
+    deferred to a follow-up commit.
+    """
+
+    @pytest.fixture
+    def conv(self):
+        return "conv-pwfm"
+
+    def _seed_running_op(
+        self, store: SQLiteStore, conv: str, op: str, worker: str,
+    ) -> None:
+        from virtual_context.core.canonical_turns import utcnow_iso
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO conversation_lifecycle "
+            "(conversation_id, generation, deleted, updated_at) "
+            "VALUES (?, 0, 0, ?)",
+            (conv, now),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO conversations "
+            "(conversation_id, tenant_id, phase, lifecycle_epoch, "
+            " created_at, updated_at) "
+            "VALUES (?, 't', 'compacting', 1, ?, ?)",
+            (conv, now, now),
+        )
+        conn.execute(
+            """INSERT INTO compaction_operation
+               (operation_id, conversation_id, lifecycle_epoch,
+                phase_index, phase_count, phase_name, status,
+                started_at, heartbeat_ts, owner_worker_id, created_at)
+               VALUES (?, ?, 1, 0, 7, 'starting', 'running',
+                       ?, ?, ?, ?)""",
+            (op, conv, now, now, worker, now),
+        )
+        conn.execute(
+            """INSERT INTO facts
+               (id, subject, verb, object, status, what,
+                conversation_id, mentioned_at, session_date)
+               VALUES ('f-existing', 's', 'v', 'o', 'active', 'w',
+                       ?, ?, ?)""",
+            (conv, now, now),
+        )
+        conn.commit()
+
+    def _fact_fields(self, store: SQLiteStore) -> tuple[str, str, str]:
+        row = store._get_conn().execute(
+            "SELECT verb, object, what FROM facts WHERE id = 'f-existing'",
+        ).fetchone()
+        assert row is not None
+        return row["verb"], row["object"], row["what"]
+
+    def test_active_raises_on_mismatch(self, tmp_path, conv):
+        from virtual_context.types import CompactionLeaseLost
+        store = SQLiteStore(
+            tmp_path / "pwm-act.db",
+            compaction_fence_mode=CompactionFenceMode.ACTIVE,
+        )
+        self._seed_running_op(store, conv, "op-real", "w-1")
+        with pytest.raises(CompactionLeaseLost):
+            store.update_fact_fields(
+                "f-existing", "v2", "o2", "active", "w2",
+                operation_id="op-mismatch",
+                owner_worker_id="w-1", lifecycle_epoch=1,
+            )
+        assert self._fact_fields(store) == ("v", "o", "w")
+
+    def test_observe_logs_warning_and_returns(self, tmp_path, conv, caplog):
+        store = SQLiteStore(
+            tmp_path / "pwm-obs.db",
+            compaction_fence_mode=CompactionFenceMode.OBSERVE,
+        )
+        self._seed_running_op(store, conv, "op-real", "w-1")
+        with caplog.at_level("WARNING"):
+            store.update_fact_fields(
+                "f-existing", "v2", "o2", "active", "w2",
+                operation_id="op-mismatch",
+                owner_worker_id="w-1", lifecycle_epoch=1,
+            )
+        msgs = [
+            r.message for r in caplog.records
+            if "COMPACTION_FENCE_OBSERVED_MISMATCH" in r.message
+            and "update_fact_fields" in r.message
+        ]
+        assert msgs, "OBSERVE must log the mismatch"
+        assert self._fact_fields(store) == ("v", "o", "w")
+
+    def test_observe_does_not_leak_open_transaction(self, tmp_path, conv):
+        """Regression for the Codex-flagged P1: per-write methods that
+        open ``BEGIN IMMEDIATE`` must close the transaction before
+        returning at OBSERVE/OFF. Without the unconditional ROLLBACK,
+        the next per-write call would fail with ``cannot start a
+        transaction within a transaction``.
+        """
+        from virtual_context.types import ChunkEmbedding
+        store = SQLiteStore(
+            tmp_path / "leak-obs.db",
+            compaction_fence_mode=CompactionFenceMode.OBSERVE,
+        )
+        self._seed_running_op(store, conv, "op-real", "w-1")
+        # Seed a segment in the active op's conversation so the cross-
+        # conv probe in store_chunk_embeddings fires the mismatch.
+        from virtual_context.core.canonical_turns import utcnow_iso
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            """INSERT INTO segments
+               (ref, conversation_id, summary, full_text, primary_tag,
+                compaction_model, created_at, start_timestamp,
+                end_timestamp)
+               VALUES ('seg-real', 'conv-other', 's', 'f', 't',
+                       'pass', ?, ?, ?)""",
+            (now, now, now),
+        )
+        conn.commit()
+
+        chunk = ChunkEmbedding(
+            segment_ref="seg-real", chunk_index=0, text="x",
+            embedding=[0.0],
+        )
+        # First call: cross-conv probe fails -> OBSERVE logs +
+        # returns. The connection MUST NOT be left in an open txn.
+        store.store_chunk_embeddings(
+            "seg-real", [chunk],
+            operation_id="op-real", owner_worker_id="w-1",
+            lifecycle_epoch=1, conversation_id=conv,
+        )
+        assert not conn.in_transaction, (
+            "OBSERVE-mode early return left an open transaction; "
+            "the next BEGIN IMMEDIATE will fail"
+        )
+        # Second call confirms no transaction-in-transaction error.
+        store.store_chunk_embeddings(
+            "seg-real", [chunk],
+            operation_id="op-real", owner_worker_id="w-1",
+            lifecycle_epoch=1, conversation_id=conv,
+        )
+
+    def test_replace_facts_no_data_loss_at_observe(self, tmp_path, conv):
+        """Regression for the second Codex P1: at OBSERVE/OFF, a
+        per-fact INSERT mismatch inside ``replace_facts_for_segment``
+        used to commit the pre-loop DELETE without a matching INSERT
+        and leave the segment factless. The fix downgrades the
+        method to the legacy unguarded path at OBSERVE/OFF so the
+        DELETE+INSERT batch runs atomically without per-fact guard
+        rejections. At ACTIVE the original guarded behavior holds.
+        """
+        from virtual_context.types import Fact
+        from virtual_context.core.canonical_turns import utcnow_iso
+        store = SQLiteStore(
+            tmp_path / "rfs-obs.db",
+            compaction_fence_mode=CompactionFenceMode.OBSERVE,
+        )
+        self._seed_running_op(store, conv, "op-real", "w-1")
+        # Seed a pre-existing fact at the segment.
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            """INSERT INTO facts
+               (id, subject, verb, object, status, what,
+                conversation_id, segment_ref, mentioned_at,
+                session_date)
+               VALUES ('f-pre', 's', 'v', 'o', 'active', 'w',
+                       ?, 'seg-rf', ?, ?)""",
+            (conv, now, now),
+        )
+        conn.commit()
+
+        # Use a MISMATCHED operation_id (no running op_row matches)
+        # so the probe at the top of replace_facts_for_segment would
+        # fail under the pre-fix code path at OBSERVE. The data-loss
+        # window opened when the DELETE committed before the per-fact
+        # INSERT mismatch; the helper continued the loop while the
+        # DELETE stayed, leaving the segment factless. With the fix
+        # in place, the method downgrades to the legacy unguarded
+        # path at OBSERVE/OFF so the DELETE+INSERT batch runs
+        # atomically without consulting the guard.
+        new_fact = Fact(
+            id="f-new", subject="s", verb="v", object="o",
+            conversation_id=conv, segment_ref="seg-rf",
+        )
+        deleted, inserted = store.replace_facts_for_segment(
+            conv, "seg-rf", [new_fact],
+            operation_id="op-mismatched-no-such-op",
+            owner_worker_id="w-1",
+            lifecycle_epoch=1,
+        )
+        # The legacy path replaced the fact atomically.
+        assert deleted == 1
+        assert inserted == 1
+        # Segment now has exactly the new fact, no data loss.
+        row = conn.execute(
+            "SELECT id FROM facts WHERE segment_ref = 'seg-rf'",
+        ).fetchall()
+        ids = {r[0] for r in row}
+        assert ids == {"f-new"}, (
+            f"OBSERVE-mode replace_facts_for_segment left the segment "
+            f"with fact ids={ids}; expected just the new fact"
+        )
+
+    def test_off_silent_and_returns(self, tmp_path, conv, caplog):
+        store = SQLiteStore(
+            tmp_path / "pwm-off.db",
+            compaction_fence_mode=CompactionFenceMode.OFF,
+        )
+        self._seed_running_op(store, conv, "op-real", "w-1")
+        with caplog.at_level("WARNING"):
+            store.update_fact_fields(
+                "f-existing", "v2", "o2", "active", "w2",
+                operation_id="op-mismatch",
+                owner_worker_id="w-1", lifecycle_epoch=1,
+            )
+        msgs = [
+            r.message for r in caplog.records
+            if "COMPACTION_FENCE_OBSERVED_MISMATCH" in r.message
+        ]
+        assert not msgs, "OFF must be silent"
+        assert self._fact_fields(store) == ("v", "o", "w")
 
 
 class TestCompositeStoreModeMismatch:
