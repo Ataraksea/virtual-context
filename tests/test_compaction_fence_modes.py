@@ -467,15 +467,19 @@ class TestPerWriteFenceModeMatrix:
     Verify the same guarded write at all three tiers:
 
     * ACTIVE: rejects via ``CompactionLeaseLost`` (existing behavior).
-    * OBSERVE: logs ``COMPACTION_FENCE_OBSERVED_MISMATCH`` and the
-      method returns normally without raising; the write does NOT
-      land because the guard SQL produced rowcount=0.
-    * OFF: silent no-op; the write does NOT land for the same reason.
+    * OBSERVE: the method takes the legacy unguarded path via the
+      OFF=legacy-SQL downgrade; the write LANDS and no mismatch log
+      fires because the guard SQL never runs. Documented spec
+      deviation: OBSERVE no longer stamps ``operation_id`` for the
+      six fenced methods. Per fencing plan §9.1 + the lead's
+      directive on OFF acting as a kill switch.
+    * OFF: same legacy unguarded path as OBSERVE; the write lands
+      silently. Per spec §9.1 kill-switch semantics.
 
-    The "write does not land at OFF" semantic is the V1 kill-switch
-    -- the documented spec target ("OFF = full legacy behavior with
-    unguarded SQL") requires per-method guard_all bypass refactoring
-    deferred to a follow-up commit.
+    ``replace_facts_for_segment`` was the first method to use this
+    pattern (deferred from fencing P7-behavioral pt.2 because of
+    the pre-INSERT DELETE data-loss window). The other six
+    methods now share the same downgrade for consistency.
     """
 
     @pytest.fixture
@@ -542,7 +546,18 @@ class TestPerWriteFenceModeMatrix:
             )
         assert self._fact_fields(store) == ("v", "o", "w")
 
-    def test_observe_logs_warning_and_returns(self, tmp_path, conv, caplog):
+    def test_observe_writes_via_legacy_path_no_mismatch_log(
+        self, tmp_path, conv, caplog,
+    ):
+        """At OBSERVE the OFF=legacy-SQL downgrade applies: the
+        method takes the legacy unguarded UPDATE path. The write
+        lands and no mismatch is logged because the guard SQL
+        never runs. Documented spec deviation: OBSERVE no longer
+        stamps ``operation_id`` for the six fenced methods that
+        share the ``replace_facts_for_segment``-style downgrade.
+        Per fencing plan §9.1 + the lead's directive on OFF acting
+        as a kill switch rather than a soft-drop of writes.
+        """
         store = SQLiteStore(
             tmp_path / "pwm-obs.db",
             compaction_fence_mode=CompactionFenceMode.OBSERVE,
@@ -554,20 +569,24 @@ class TestPerWriteFenceModeMatrix:
                 operation_id="op-mismatch",
                 owner_worker_id="w-1", lifecycle_epoch=1,
             )
+        # Legacy path ran: write landed with the new field values.
+        assert self._fact_fields(store) == ("v2", "o2", "w2")
+        # No mismatch log because the guard SQL was bypassed by the
+        # OFF=legacy-SQL downgrade.
         msgs = [
             r.message for r in caplog.records
             if "COMPACTION_FENCE_OBSERVED_MISMATCH" in r.message
             and "update_fact_fields" in r.message
         ]
-        assert msgs, "OBSERVE must log the mismatch"
-        assert self._fact_fields(store) == ("v", "o", "w")
+        assert not msgs
 
-    def test_observe_does_not_leak_open_transaction(self, tmp_path, conv):
-        """Regression for the Codex-flagged P1: per-write methods that
-        open ``BEGIN IMMEDIATE`` must close the transaction before
-        returning at OBSERVE/OFF. Without the unconditional ROLLBACK,
-        the next per-write call would fail with ``cannot start a
-        transaction within a transaction``.
+    def test_observe_legacy_path_does_not_leak_open_transaction(
+        self, tmp_path, conv,
+    ):
+        """At OBSERVE the OFF=legacy-SQL downgrade bypasses the guard
+        probe for per-write methods that open ``BEGIN IMMEDIATE``. The
+        legacy write path must still commit/close the transaction so
+        the next per-write call can start its own transaction.
         """
         from virtual_context.types import ChunkEmbedding
         store = SQLiteStore(
@@ -575,8 +594,9 @@ class TestPerWriteFenceModeMatrix:
             compaction_fence_mode=CompactionFenceMode.OBSERVE,
         )
         self._seed_running_op(store, conv, "op-real", "w-1")
-        # Seed a segment in the active op's conversation so the cross-
-        # conv probe in store_chunk_embeddings fires the mismatch.
+        # Seed a segment outside the supplied conversation. OBSERVE
+        # bypasses the guard and takes the legacy path, which ignores
+        # the caller-supplied conversation_id for this write.
         from virtual_context.core.canonical_turns import utcnow_iso
         now = utcnow_iso()
         conn = store._get_conn()
@@ -595,15 +615,15 @@ class TestPerWriteFenceModeMatrix:
             segment_ref="seg-real", chunk_index=0, text="x",
             embedding=[0.0],
         )
-        # First call: cross-conv probe fails -> OBSERVE logs +
-        # returns. The connection MUST NOT be left in an open txn.
+        # First call: OBSERVE takes the legacy path. The connection
+        # MUST NOT be left in an open transaction.
         store.store_chunk_embeddings(
             "seg-real", [chunk],
             operation_id="op-real", owner_worker_id="w-1",
             lifecycle_epoch=1, conversation_id=conv,
         )
         assert not conn.in_transaction, (
-            "OBSERVE-mode early return left an open transaction; "
+            "OBSERVE-mode legacy write left an open transaction; "
             "the next BEGIN IMMEDIATE will fail"
         )
         # Second call confirms no transaction-in-transaction error.
@@ -675,7 +695,17 @@ class TestPerWriteFenceModeMatrix:
             f"with fact ids={ids}; expected just the new fact"
         )
 
-    def test_off_silent_and_returns(self, tmp_path, conv, caplog):
+    def test_off_writes_via_legacy_path_silently(
+        self, tmp_path, conv, caplog,
+    ):
+        """At OFF the kill-switch downgrade applies: the method
+        takes the legacy unguarded UPDATE path with no
+        ``operation_id`` stamp. The write lands and no log
+        fires because the guard SQL never runs. Per fencing
+        plan §9.1: OFF is a kill switch, not a soft-drop. A
+        mismatched ``operation_id`` is irrelevant when the
+        guard is bypassed.
+        """
         store = SQLiteStore(
             tmp_path / "pwm-off.db",
             compaction_fence_mode=CompactionFenceMode.OFF,
@@ -687,12 +717,275 @@ class TestPerWriteFenceModeMatrix:
                 operation_id="op-mismatch",
                 owner_worker_id="w-1", lifecycle_epoch=1,
             )
+        # Legacy path ran: write landed with the new field values.
+        assert self._fact_fields(store) == ("v2", "o2", "w2")
+        # OFF stays silent: no mismatch helper invocation, no log.
         msgs = [
             r.message for r in caplog.records
             if "COMPACTION_FENCE_OBSERVED_MISMATCH" in r.message
         ]
-        assert not msgs, "OFF must be silent"
-        assert self._fact_fields(store) == ("v", "o", "w")
+        assert not msgs
+
+
+class TestOffLegacySqlGate:
+    """At OFF the six fenced methods take the legacy unguarded SQL
+    path with no ``operation_id`` stamp. The mismatched
+    ``operation_id`` kwarg is irrelevant because the guard SQL is
+    bypassed entirely. Per fencing plan §9.1: OFF is a kill
+    switch, mirroring ``replace_facts_for_segment``'s carve-out.
+
+    Each test calls the method with guard kwargs that would NOT
+    match any running ``compaction_operation`` row, then verifies
+    the write landed and the persisted ``operation_id`` column is
+    ``NULL`` on tables that carry it.
+    """
+
+    @pytest.fixture
+    def conv(self):
+        return "conv-off-legacy"
+
+    def _store(self, tmp_path, name):
+        return SQLiteStore(
+            tmp_path / f"off-legacy-{name}.db",
+            compaction_fence_mode=CompactionFenceMode.OFF,
+        )
+
+    def _seed_conv(self, store: SQLiteStore, conv: str) -> None:
+        from virtual_context.core.canonical_turns import utcnow_iso
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            "INSERT OR IGNORE INTO conversation_lifecycle "
+            "(conversation_id, generation, deleted, updated_at) "
+            "VALUES (?, 0, 0, ?)",
+            (conv, now),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO conversations "
+            "(conversation_id, tenant_id, phase, lifecycle_epoch, "
+            " created_at, updated_at) "
+            "VALUES (?, 't', 'active', 1, ?, ?)",
+            (conv, now, now),
+        )
+        conn.commit()
+
+    def _seed_segment(
+        self, store: SQLiteStore, conv: str, seg_ref: str,
+    ) -> None:
+        from virtual_context.core.canonical_turns import utcnow_iso
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            """INSERT INTO segments
+               (ref, conversation_id, summary, full_text, primary_tag,
+                compaction_model, created_at, start_timestamp,
+                end_timestamp)
+               VALUES (?, ?, 's', 'f', 't', 'pass', ?, ?, ?)""",
+            (seg_ref, conv, now, now, now),
+        )
+        conn.commit()
+
+    def _seed_fact(
+        self, store: SQLiteStore, conv: str, fact_id: str,
+    ) -> None:
+        from virtual_context.core.canonical_turns import utcnow_iso
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            """INSERT INTO facts
+               (id, subject, verb, object, status, what,
+                conversation_id, mentioned_at, session_date)
+               VALUES (?, 's', 'v', 'o', 'active', 'w',
+                       ?, ?, ?)""",
+            (fact_id, conv, now, now),
+        )
+        conn.commit()
+
+    # ------------------------------------------------------------------
+    # store_facts
+    # ------------------------------------------------------------------
+    def test_store_facts_legacy_path_lands_write_without_operation_id(
+        self, tmp_path, conv,
+    ):
+        from virtual_context.types import Fact
+        store = self._store(tmp_path, "store-facts")
+        self._seed_conv(store, conv)
+        # No running compaction_operation row exists; mismatched op
+        # would fail the guarded INSERT-SELECT. OFF downgrades guard
+        # so the legacy INSERT OR REPLACE path runs unconditionally.
+        fact = Fact(
+            id="f-off", subject="s", verb="v", object="o",
+            conversation_id=conv,
+        )
+        count = store.store_facts(
+            [fact],
+            operation_id="op-bogus",
+            owner_worker_id="w-bogus", lifecycle_epoch=1,
+        )
+        assert count == 1
+        row = store._get_conn().execute(
+            "SELECT id, operation_id FROM facts WHERE id = 'f-off'",
+        ).fetchone()
+        assert row is not None
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy INSERT with no operation_id stamp"
+        )
+
+    # ------------------------------------------------------------------
+    # set_fact_superseded
+    # ------------------------------------------------------------------
+    def test_set_fact_superseded_legacy_path_lands_write(
+        self, tmp_path, conv,
+    ):
+        store = self._store(tmp_path, "set-superseded")
+        self._seed_conv(store, conv)
+        self._seed_fact(store, conv, "f-old")
+        self._seed_fact(store, conv, "f-new")
+        # No running op matches; ACTIVE would reject; OFF downgrades.
+        store.set_fact_superseded(
+            "f-old", "f-new",
+            operation_id="op-bogus",
+            owner_worker_id="w-bogus", lifecycle_epoch=1,
+        )
+        row = store._get_conn().execute(
+            """SELECT superseded_by, operation_id
+                 FROM facts WHERE id = 'f-old'""",
+        ).fetchone()
+        assert row is not None
+        assert row["superseded_by"] == "f-new"
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy SQL with no operation_id stamp"
+        )
+
+    # ------------------------------------------------------------------
+    # update_fact_fields
+    # ------------------------------------------------------------------
+    def test_update_fact_fields_legacy_path_lands_write(
+        self, tmp_path, conv,
+    ):
+        store = self._store(tmp_path, "update-fields")
+        self._seed_conv(store, conv)
+        self._seed_fact(store, conv, "f-edit")
+        store.update_fact_fields(
+            "f-edit", "v2", "o2", "active", "w2",
+            operation_id="op-bogus",
+            owner_worker_id="w-bogus", lifecycle_epoch=1,
+        )
+        row = store._get_conn().execute(
+            """SELECT verb, object, what, operation_id
+                 FROM facts WHERE id = 'f-edit'""",
+        ).fetchone()
+        assert row is not None
+        assert (row["verb"], row["object"], row["what"]) == (
+            "v2", "o2", "w2",
+        )
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy SQL with no operation_id stamp"
+        )
+
+    # ------------------------------------------------------------------
+    # store_chunk_embeddings
+    # ------------------------------------------------------------------
+    def test_store_chunk_embeddings_legacy_path_lands_write(
+        self, tmp_path, conv,
+    ):
+        from virtual_context.types import ChunkEmbedding
+        store = self._store(tmp_path, "chunk-emb")
+        self._seed_conv(store, conv)
+        self._seed_segment(store, conv, "seg-off")
+        chunk = ChunkEmbedding(
+            segment_ref="seg-off", chunk_index=0, text="x",
+            embedding=[0.0],
+        )
+        store.store_chunk_embeddings(
+            "seg-off", [chunk],
+            operation_id="op-bogus", owner_worker_id="w-bogus",
+            lifecycle_epoch=1, conversation_id=conv,
+        )
+        row = store._get_conn().execute(
+            """SELECT segment_ref, chunk_index, operation_id
+                 FROM segment_chunks WHERE segment_ref = 'seg-off'""",
+        ).fetchone()
+        assert row is not None
+        assert row["chunk_index"] == 0
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy INSERT with no operation_id stamp"
+        )
+
+    # ------------------------------------------------------------------
+    # store_fact_links
+    # ------------------------------------------------------------------
+    def test_store_fact_links_legacy_path_lands_write(
+        self, tmp_path, conv,
+    ):
+        from virtual_context.types import FactLink
+        store = self._store(tmp_path, "fact-links")
+        self._seed_conv(store, conv)
+        self._seed_fact(store, conv, "f-src")
+        self._seed_fact(store, conv, "f-tgt")
+        link = FactLink(
+            id="fl-off",
+            source_fact_id="f-src",
+            target_fact_id="f-tgt",
+            relation_type="related_to",
+            confidence=1.0,
+            context="ctx",
+            created_by="u",
+        )
+        count = store.store_fact_links(
+            [link],
+            operation_id="op-bogus",
+            owner_worker_id="w-bogus", lifecycle_epoch=1,
+            conversation_id=conv,
+        )
+        assert count == 1
+        row = store._get_conn().execute(
+            "SELECT id, operation_id FROM fact_links WHERE id = 'fl-off'",
+        ).fetchone()
+        assert row is not None
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy INSERT with no operation_id stamp"
+        )
+
+    # ------------------------------------------------------------------
+    # link_segment_tool_output
+    # ------------------------------------------------------------------
+    def test_link_segment_tool_output_legacy_path_lands_write(
+        self, tmp_path, conv,
+    ):
+        store = self._store(tmp_path, "link-stout")
+        self._seed_conv(store, conv)
+        self._seed_segment(store, conv, "seg-link")
+        # Seed a tool_outputs row so the link references a real ref;
+        # the link table itself does not enforce FK to tool_outputs
+        # but seeding keeps the fixture realistic.
+        from virtual_context.core.canonical_turns import utcnow_iso
+        now = utcnow_iso()
+        conn = store._get_conn()
+        conn.execute(
+            """INSERT OR IGNORE INTO tool_outputs
+               (ref, conversation_id, turn, content, created_at)
+               VALUES ('to-off', ?, 0, '{}', ?)""",
+            (conv, now),
+        )
+        conn.commit()
+        store.link_segment_tool_output(
+            conv, "seg-link", "to-off",
+            operation_id="op-bogus",
+            owner_worker_id="w-bogus", lifecycle_epoch=1,
+        )
+        row = conn.execute(
+            """SELECT conversation_id, segment_ref, tool_output_ref,
+                       operation_id
+                 FROM segment_tool_outputs
+                WHERE segment_ref = 'seg-link'""",
+        ).fetchone()
+        assert row is not None
+        assert (row["conversation_id"], row["segment_ref"],
+                row["tool_output_ref"]) == (conv, "seg-link", "to-off")
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy INSERT with no operation_id stamp"
+        )
 
 
 class TestCompositeStoreModeMismatch:

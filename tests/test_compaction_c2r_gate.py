@@ -56,7 +56,7 @@ from virtual_context.types import (
 
 class _ChunkSpyStore:
     """The minimum interface ``embed_and_store_chunks`` actually touches:
-    ``get_all_chunk_embeddings`` for the C2R existence probe and
+    ``has_chunks_for_segment`` for the C2R existence probe and
     ``store_chunk_embeddings`` for the write. Every call is recorded so
     tests can assert which paths fired.
     """
@@ -64,6 +64,7 @@ class _ChunkSpyStore:
     def __init__(self) -> None:
         self._chunks: list[ChunkEmbedding] = []
         self.store_calls: int = 0
+        self.probe_calls: int = 0
 
     def seed_chunk(self, segment_ref: str) -> None:
         self._chunks.append(ChunkEmbedding(
@@ -72,6 +73,10 @@ class _ChunkSpyStore:
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return list(self._chunks)
+
+    def has_chunks_for_segment(self, segment_ref: str) -> bool:
+        self.probe_calls += 1
+        return any(c.segment_ref == segment_ref for c in self._chunks)
 
     def store_chunk_embeddings(self, *args: Any, **kwargs: Any) -> None:
         self.store_calls += 1
@@ -137,6 +142,27 @@ class TestT53_EmbedAndStoreChunksGate:
         sm.embed_and_store_chunks(seg, disable_replacement_passes=True)
 
         # Pure-insert path: gate is dormant.
+        assert store.store_calls == 1
+
+    def test_gate_true_uses_segment_scoped_probe_not_full_scan(self):
+        """C2R existence probe must be a single-segment lookup, not a
+        scan over every chunk in the store. The spy's
+        ``probe_calls`` counter goes up when the new
+        ``has_chunks_for_segment`` API is used; if the gate ever
+        regresses to the old ``get_all_chunk_embeddings`` filter the
+        counter stays at zero. Per codex P5 follow-up.
+        """
+        store = _ChunkSpyStore()
+        store.seed_chunk("seg-other-1")
+        store.seed_chunk("seg-other-2")
+        sm = _make_semantic(store)
+        seg = _make_segment(ref="seg-target")
+
+        sm.embed_and_store_chunks(seg, disable_replacement_passes=True)
+
+        # The new API was invoked.
+        assert store.probe_calls == 1
+        # Pure-insert path proceeded (the target segment had no chunks).
         assert store.store_calls == 1
 
     def test_gate_false_writes_even_when_chunks_exist(self):

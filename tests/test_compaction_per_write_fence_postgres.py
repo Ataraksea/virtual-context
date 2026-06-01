@@ -54,6 +54,23 @@ def store():
     yield s
 
 
+@pytest.fixture(scope="module")
+def off_store():
+    """OFF-mode Postgres store for the OFF=legacy-SQL gate tests.
+
+    At OFF the six fenced methods downgrade ``guard_all`` to False
+    and take the legacy unguarded SQL path with no
+    ``operation_id`` stamp. Per fencing plan §9.1.
+    """
+    from virtual_context.core.compaction_fence import CompactionFenceMode
+    from virtual_context.storage.postgres import PostgresStore
+    s = PostgresStore(
+        os.environ["DATABASE_URL"],
+        compaction_fence_mode=CompactionFenceMode.OFF,
+    )
+    yield s
+
+
 def _seed_running_op(store, conv_id: str, *, op_id: str, worker_id: str,
                      epoch: int = 1, tenant_id: str = "t-default") -> None:
     """Seed conversation + lifecycle + running compaction_operation in PG."""
@@ -372,3 +389,260 @@ class TestT324_PGCrossTenantProbe:
                 old, new,
                 operation_id=op, owner_worker_id=worker, lifecycle_epoch=1,
             )
+
+
+@_pg_required
+class TestT325_PGOffLegacySqlGate:
+    """T3.25: at OFF the six fenced methods take the legacy
+    unguarded SQL path with no ``operation_id`` stamp. The
+    mismatched ``operation_id`` kwarg is irrelevant because the
+    guard SQL is bypassed entirely. Per fencing plan §9.1 OFF
+    kill switch -- mirrors the SQLite ``TestOffLegacySqlGate``
+    coverage end-to-end on Postgres.
+    """
+
+    def test_store_facts_legacy_path_lands_write_without_op_id(
+        self, off_store,
+    ):
+        conv = f"pg-t325-sf-{uuid.uuid4().hex[:8]}"
+        # Seed conv + lifecycle WITHOUT a running op so a guarded
+        # INSERT-SELECT would write zero rows. OFF downgrades the
+        # guard so the legacy INSERT OR REPLACE lands.
+        with off_store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle
+                       (conversation_id, generation, deleted, updated_at)
+                       VALUES (%s, 0, FALSE, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS),
+                )
+                conn.execute(
+                    """INSERT INTO conversations
+                       (conversation_id, tenant_id, phase, lifecycle_epoch,
+                        created_at, updated_at)
+                       VALUES (%s, 't-off', 'active', 1, %s, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS, _TS),
+                )
+        fid = f"fact-{uuid.uuid4().hex[:8]}"
+        fact = Fact(
+            id=fid, subject="s", verb="v", object="o",
+            conversation_id=conv,
+        )
+        off_store.store_facts(
+            [fact],
+            operation_id="op-bogus", owner_worker_id="w-bogus",
+            lifecycle_epoch=1,
+        )
+        assert _fact_operation_id(off_store, fid) is None
+
+    def test_set_fact_superseded_legacy_path_lands_write(self, off_store):
+        conv = f"pg-t325-sup-{uuid.uuid4().hex[:8]}"
+        with off_store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle
+                       (conversation_id, generation, deleted, updated_at)
+                       VALUES (%s, 0, FALSE, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS),
+                )
+                conn.execute(
+                    """INSERT INTO conversations
+                       (conversation_id, tenant_id, phase, lifecycle_epoch,
+                        created_at, updated_at)
+                       VALUES (%s, 't-off', 'active', 1, %s, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS, _TS),
+                )
+        old = f"fact-{uuid.uuid4().hex[:8]}"
+        new = f"fact-{uuid.uuid4().hex[:8]}"
+        _seed_fact(off_store, old, conv)
+        _seed_fact(off_store, new, conv)
+        off_store.set_fact_superseded(
+            old, new,
+            operation_id="op-bogus", owner_worker_id="w-bogus",
+            lifecycle_epoch=1,
+        )
+        with off_store.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT superseded_by, operation_id
+                     FROM facts WHERE id = %s""",
+                (old,),
+            ).fetchone()
+        assert row is not None
+        assert row["superseded_by"] == new
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy SQL with no operation_id stamp"
+        )
+
+    def test_update_fact_fields_legacy_path_lands_write(self, off_store):
+        conv = f"pg-t325-uff-{uuid.uuid4().hex[:8]}"
+        with off_store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle
+                       (conversation_id, generation, deleted, updated_at)
+                       VALUES (%s, 0, FALSE, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS),
+                )
+                conn.execute(
+                    """INSERT INTO conversations
+                       (conversation_id, tenant_id, phase, lifecycle_epoch,
+                        created_at, updated_at)
+                       VALUES (%s, 't-off', 'active', 1, %s, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS, _TS),
+                )
+        fid = f"fact-{uuid.uuid4().hex[:8]}"
+        _seed_fact(off_store, fid, conv)
+        off_store.update_fact_fields(
+            fid, "knows", "python", "completed", "learned",
+            operation_id="op-bogus", owner_worker_id="w-bogus",
+            lifecycle_epoch=1,
+        )
+        with off_store.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT verb, object, what, operation_id
+                     FROM facts WHERE id = %s""",
+                (fid,),
+            ).fetchone()
+        assert row is not None
+        assert (row["verb"], row["object"], row["what"]) == (
+            "knows", "python", "learned",
+        )
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy SQL with no operation_id stamp"
+        )
+
+    def test_store_chunk_embeddings_legacy_path_lands_write(
+        self, off_store,
+    ):
+        conv = f"pg-t325-chunks-{uuid.uuid4().hex[:8]}"
+        with off_store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle
+                       (conversation_id, generation, deleted, updated_at)
+                       VALUES (%s, 0, FALSE, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS),
+                )
+                conn.execute(
+                    """INSERT INTO conversations
+                       (conversation_id, tenant_id, phase, lifecycle_epoch,
+                        created_at, updated_at)
+                       VALUES (%s, 't-off', 'active', 1, %s, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS, _TS),
+                )
+        seg = f"seg-{uuid.uuid4().hex[:8]}"
+        _seed_segment(off_store, seg, conv)
+        off_store.store_chunk_embeddings(
+            seg,
+            [ChunkEmbedding(segment_ref=seg, chunk_index=0,
+                            text="x", embedding=[0.1])],
+            operation_id="op-bogus", owner_worker_id="w-bogus",
+            lifecycle_epoch=1, conversation_id=conv,
+        )
+        with off_store.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT chunk_index, operation_id
+                     FROM segment_chunks WHERE segment_ref = %s""",
+                (seg,),
+            ).fetchone()
+        assert row is not None
+        assert row["chunk_index"] == 0
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy INSERT with no operation_id stamp"
+        )
+
+    def test_store_fact_links_legacy_path_lands_write(self, off_store):
+        conv = f"pg-t325-fl-{uuid.uuid4().hex[:8]}"
+        with off_store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle
+                       (conversation_id, generation, deleted, updated_at)
+                       VALUES (%s, 0, FALSE, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS),
+                )
+                conn.execute(
+                    """INSERT INTO conversations
+                       (conversation_id, tenant_id, phase, lifecycle_epoch,
+                        created_at, updated_at)
+                       VALUES (%s, 't-off', 'active', 1, %s, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS, _TS),
+                )
+        src = f"fact-{uuid.uuid4().hex[:8]}"
+        tgt = f"fact-{uuid.uuid4().hex[:8]}"
+        _seed_fact(off_store, src, conv)
+        _seed_fact(off_store, tgt, conv)
+        link = FactLink(
+            source_fact_id=src, target_fact_id=tgt,
+            relation_type="r", confidence=1.0, context="c",
+            created_by="compaction",
+        )
+        n = off_store.store_fact_links(
+            [link],
+            operation_id="op-bogus", owner_worker_id="w-bogus",
+            lifecycle_epoch=1, conversation_id=conv,
+        )
+        assert n == 1
+        with off_store.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT operation_id FROM fact_links
+                    WHERE source_fact_id = %s AND target_fact_id = %s""",
+                (src, tgt),
+            ).fetchone()
+        assert row is not None
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy INSERT with no operation_id stamp"
+        )
+
+    def test_link_segment_tool_output_legacy_path_lands_write(
+        self, off_store,
+    ):
+        conv = f"pg-t325-lsto-{uuid.uuid4().hex[:8]}"
+        with off_store.pool.connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    """INSERT INTO conversation_lifecycle
+                       (conversation_id, generation, deleted, updated_at)
+                       VALUES (%s, 0, FALSE, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS),
+                )
+                conn.execute(
+                    """INSERT INTO conversations
+                       (conversation_id, tenant_id, phase, lifecycle_epoch,
+                        created_at, updated_at)
+                       VALUES (%s, 't-off', 'active', 1, %s, %s)
+                       ON CONFLICT (conversation_id) DO NOTHING""",
+                    (conv, _TS, _TS),
+                )
+        seg = f"seg-{uuid.uuid4().hex[:8]}"
+        tool_ref = f"tool-{uuid.uuid4().hex[:8]}"
+        off_store.link_segment_tool_output(
+            conv, seg, tool_ref,
+            operation_id="op-bogus", owner_worker_id="w-bogus",
+            lifecycle_epoch=1,
+        )
+        with off_store.pool.connection() as conn:
+            row = conn.execute(
+                """SELECT conversation_id, segment_ref, tool_output_ref,
+                          operation_id
+                     FROM segment_tool_outputs
+                    WHERE segment_ref = %s""",
+                (seg,),
+            ).fetchone()
+        assert row is not None
+        assert (row["conversation_id"], row["segment_ref"],
+                row["tool_output_ref"]) == (conv, seg, tool_ref)
+        assert row["operation_id"] is None, (
+            "OFF mode must use legacy INSERT with no operation_id stamp"
+        )

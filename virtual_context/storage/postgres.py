@@ -470,6 +470,59 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# Normative SQL for the compaction-backlog detection query per
+# ``specs/compaction-backlog-sweeper.md`` §3.1. Declared at module
+# level so the inspector and the test bundle can pin it without
+# duplicating the body.
+_BACKLOG_DETECTION_SQL = """
+WITH backlog AS (
+  SELECT ct.conversation_id, COUNT(*) AS backlog_turns
+    FROM canonical_turns ct
+   WHERE ct.tagged_at IS NOT NULL
+     AND ct.compacted_at IS NULL
+   GROUP BY ct.conversation_id
+  HAVING COUNT(*) >= %(min_backlog_turns)s
+),
+last_terminal AS (
+  SELECT co.conversation_id, co.lifecycle_epoch,
+         MAX(COALESCE(co.completed_at, co.started_at)) AS last_terminal_at
+    FROM compaction_operation co
+   WHERE co.status IN ('completed', 'failed', 'abandoned', 'cancelled')
+   GROUP BY co.conversation_id, co.lifecycle_epoch
+)
+SELECT c.conversation_id, c.tenant_id, c.lifecycle_epoch,
+       b.backlog_turns,
+       lt.last_terminal_at AS last_terminal_compaction_at
+  FROM backlog b
+  JOIN conversations c
+    ON c.conversation_id = b.conversation_id
+  LEFT JOIN last_terminal lt
+    ON lt.conversation_id = b.conversation_id
+   AND lt.lifecycle_epoch = c.lifecycle_epoch
+ WHERE c.phase = 'active'
+   AND c.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1
+       FROM canonical_turns ct_untagged
+      WHERE ct_untagged.conversation_id = c.conversation_id
+        AND ct_untagged.tagged_at IS NULL
+   )
+   AND NOT EXISTS (
+     SELECT 1
+       FROM compaction_operation co_live
+      WHERE co_live.conversation_id = c.conversation_id
+        AND co_live.lifecycle_epoch = c.lifecycle_epoch
+        AND co_live.status IN ('queued', 'running')
+   )
+   AND (
+     lt.last_terminal_at IS NULL
+     OR lt.last_terminal_at < (NOW() - make_interval(secs => %(grace_s)s))
+   )
+ ORDER BY b.backlog_turns DESC
+ LIMIT %(limit)s
+"""
+
+
 def _validate_compaction_guard_kwargs(
     operation_id: str | None,
     owner_worker_id: str | None,
@@ -2741,6 +2794,123 @@ class PostgresStore(ContextStore):
                     "phase_name": str(r["phase_name"] or ""),
                     "hb_age_s": float(r["hb_age_s"] or 0.0),
                 }
+                for r in rows
+            ]
+
+    def claim_compaction_backlog(
+        self,
+        *,
+        candidate: "BacklogCandidate",
+        new_operation_id: str,
+        owner_worker_id: str,
+        phase_count: int,
+        min_backlog_turns: int,
+        grace_s: float,
+    ) -> bool:
+        """Per-candidate claim that delegates phase CAS + active-op
+        insert to ``begin_compaction_with_lock`` while re-verifying
+        the backlog predicates inside the same lifecycle lock.
+
+        Per compaction-backlog sweeper spec v1.4 §3.2. The
+        re-verification predicates are the same set the §3.1
+        detection query runs but executed under the held lifecycle
+        lock so a concurrent INSERT cannot slip between the
+        detection-time snapshot the cloud caller forwards and the
+        begin primitive's phase CAS.
+
+        Returns True iff the active-op row was inserted by this
+        call. Returns False on any precondition mismatch:
+
+        * candidate.conversation_id has no lifecycle row or another
+          transaction holds the FOR UPDATE lock (SKIP LOCKED).
+        * lifecycle_epoch bumped between detection and claim.
+        * conv was deleted or its phase moved away from ``'active'``.
+        * candidate.tenant_id no longer matches.
+        * backlog count is below ``min_backlog_turns`` at claim time
+          (the threshold, NOT the stale ``candidate.backlog_turns``
+          snapshot).
+        * any ``canonical_turns`` row at ``tagged_at IS NULL``
+          appeared between detection and claim.
+        * a current-epoch ``'queued'`` or ``'running'`` op exists.
+        * the most recent current-epoch terminal compaction
+          completed within ``grace_s`` seconds.
+        * the active-op INSERT lost to the unique partial index race
+          (no-throw ``ON CONFLICT DO NOTHING RETURNING`` no row).
+
+        The claim must not contain its own phase UPDATE or active
+        ``compaction_operation`` INSERT SQL: all such writes route
+        through ``begin_compaction_with_lock``, which is in the
+        fencing inspector's ``ACTIVE_OP_INSERT_ALLOWLIST``.
+        """
+        from ..core.sweeper_backlog import (
+            verify_backlog_candidate_under_lock as _verify,
+        )
+
+        def pre_begin_check(conn) -> bool:
+            return _verify(
+                conn=conn,
+                candidate=candidate,
+                min_backlog_turns=min_backlog_turns,
+                grace_s=grace_s,
+                placeholder="%s",
+            )
+
+        return self.begin_compaction_with_lock(
+            conversation_id=candidate.conversation_id,
+            lifecycle_epoch=candidate.lifecycle_epoch,
+            worker_id=owner_worker_id,
+            new_operation_id=new_operation_id,
+            phase_count=phase_count,
+            phase_name="starting",
+            required_phase="active",
+            pre_begin_check=pre_begin_check,
+        )
+
+    def find_compaction_backlog_conversations(
+        self,
+        *,
+        min_backlog_turns: int,
+        grace_s: float,
+        limit: int,
+    ) -> list["BacklogCandidate"]:
+        """List conversations whose tagged-uncompacted backlog exceeds
+        ``min_backlog_turns`` AND that have no active
+        ``compaction_operation`` in the current lifecycle epoch AND
+        whose most recent terminal ``compaction_operation`` in that
+        epoch (if any) completed more than ``grace_s`` seconds ago.
+
+        Per compaction-backlog sweeper spec v1.4 §3.1. The liveness
+        predicates are intentionally narrower than
+        ``find_stale_ingestion_episodes``: only conversations whose
+        phase is ``'active'``, ``deleted_at IS NULL``, and where no
+        ``canonical_turns`` row has ``tagged_at IS NULL``. The
+        no-untagged-row predicate is load-bearing because the current
+        compaction loader reads every uncompacted canonical row, not
+        just tagged ones. ``'ingesting'`` conversations stay the
+        stale-ingestion finalizer's responsibility.
+
+        Ordered by ``backlog_turns DESC`` so the worst offenders
+        surface first. Capped at ``limit`` per call to bound per-tick
+        blast radius.
+        """
+        from ..types import BacklogCandidate
+        with self.pool.connection() as conn:
+            rows = conn.execute(
+                _BACKLOG_DETECTION_SQL,
+                {
+                    "min_backlog_turns": int(min_backlog_turns),
+                    "grace_s": float(grace_s),
+                    "limit": int(limit),
+                },
+            ).fetchall()
+            return [
+                BacklogCandidate(
+                    conversation_id=str(r["conversation_id"]),
+                    tenant_id=str(r["tenant_id"] or ""),
+                    lifecycle_epoch=int(r["lifecycle_epoch"]),
+                    backlog_turns=int(r["backlog_turns"]),
+                    last_terminal_compaction_at=r["last_terminal_compaction_at"],
+                )
                 for r in rows
             ]
 
@@ -5077,6 +5247,12 @@ class PostgresStore(ContextStore):
             and lifecycle_epoch is not None
             and conversation_id is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``store_chunk_embeddings`` takes the legacy unguarded
+        # DELETE+INSERT path with no operation_id stamp. Per fencing
+        # plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         with self.pool.connection() as conn:
             with conn.transaction():
                 if guard_all:
@@ -5134,6 +5310,21 @@ class PostgresStore(ContextStore):
                 )
                 for row in rows
             ]
+
+    def has_chunks_for_segment(self, segment_ref: str) -> bool:
+        """Single-row probe replacing the O(N) ``get_all_chunk_embeddings``
+        scan that the C2R gate previously used. ``LIMIT 1`` short
+        circuits the executor; the existing
+        ``segment_chunks(segment_ref)`` lookup uses the table's
+        primary key on ``(segment_ref, chunk_index)`` so the probe is
+        an index seek.
+        """
+        with self.pool.connection() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM segment_chunks WHERE segment_ref = %s LIMIT 1",
+                (segment_ref,),
+            ).fetchone()
+            return row is not None
 
     def store_canonical_turn_chunk_embeddings(
         self,
@@ -5312,6 +5503,12 @@ class PostgresStore(ContextStore):
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``link_segment_tool_output`` takes the legacy unguarded
+        # INSERT path with no operation_id stamp. Per fencing plan
+        # §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         with self.pool.connection() as conn:
             if guard_all:
                 cur = conn.execute(
@@ -6737,6 +6934,11 @@ class PostgresStore(ContextStore):
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so ``store_facts``
+        # takes the legacy unguarded INSERT ON CONFLICT path with no
+        # operation_id stamp. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
 
         with self.pool.connection() as conn:
             count = 0
@@ -7092,6 +7294,11 @@ class PostgresStore(ContextStore):
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``set_fact_superseded`` takes the legacy unguarded UPDATE
+        # path. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         with self.pool.connection() as conn:
             if guard_all:
                 cur = conn.execute(
@@ -7153,6 +7360,11 @@ class PostgresStore(ContextStore):
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``update_fact_fields`` takes the legacy unguarded UPDATE
+        # path. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         with self.pool.connection() as conn:
             if guard_all:
                 cur = conn.execute(
@@ -7260,6 +7472,11 @@ class PostgresStore(ContextStore):
             and lifecycle_epoch is not None
             and conversation_id is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so ``store_fact_links``
+        # takes the legacy unguarded INSERT ON CONFLICT path with no
+        # operation_id stamp. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         with self.pool.connection() as conn:
             count = 0
             with conn.transaction():

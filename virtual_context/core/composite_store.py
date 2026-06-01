@@ -6,6 +6,7 @@ from datetime import timedelta
 
 from .protocols import FactLinkStore, FactStore, SearchStore, SegmentStore, StateStore
 from ..types import (
+    BacklogCandidate,
     ChunkEmbedding,
     ConversationStats,
     EngineStateSnapshot,
@@ -15,6 +16,7 @@ from ..types import (
     CanonicalTurnChunkEmbedding,
     CanonicalTurnRow,
     LinkedFact,
+    Message,
     QuoteResult,
     StoredSegment,
     StoredSummary,
@@ -57,7 +59,14 @@ class CompositeStore:
             ("search", search),
         ):
             delegate_mode = getattr(delegate, "_compaction_fence_mode", None)
-            if delegate_mode is not None and delegate_mode != self._compaction_fence_mode:
+            # The mismatch guard fires ONLY when the delegate exposes
+            # a real ``CompactionFenceMode`` value. ``getattr`` against
+            # a ``MagicMock`` returns an auto-generated child mock that
+            # is not a CompactionFenceMode; treat it as "delegate does
+            # not have a holder" so the test-double pattern of building
+            # a CompositeStore from MagicMocks keeps working.
+            if (isinstance(delegate_mode, _CFM)
+                    and delegate_mode != self._compaction_fence_mode):
                 raise ValueError(
                     "CompositeStore compaction_fence_mode mismatch: "
                     f"holder={self._compaction_fence_mode.value!r} but "
@@ -329,6 +338,39 @@ class CompositeStore:
             conversation_id,
             protected_recent_turns=protected_recent_turns,
         )
+
+    def reconstruct_history_for_conv(
+        self, conversation_id: str,
+    ) -> list[Message]:
+        """Forwarder per compaction-backlog sweeper spec v1.4 §5.2.
+        Prefers a backend-native implementation when the delegate
+        exposes one; otherwise falls back to the default base
+        reconstruction via ``get_all_canonical_turns``.
+        """
+        fn = getattr(self._segments, "reconstruct_history_for_conv", None)
+        if callable(fn):
+            return list(fn(conversation_id))
+        # Fallback: reuse the ContextStore base body shape so cloud
+        # gets a consistent result no matter which delegate is wired
+        # under the composite.
+        history: list[Message] = []
+        for row in self.get_all_canonical_turns(conversation_id):
+            user_text = row.user_content or ""
+            asst_text = row.assistant_content or ""
+            if not asst_text.strip():
+                continue
+            history.append(Message(role="user", content=user_text))
+            history.append(Message(role="assistant", content=asst_text))
+        return history
+
+    def get_compaction_fence_mode(self):
+        """Forwarder for the runtime fence holder. Cloud's sweeper
+        tick reads this accessor rather than ``os.environ`` so a
+        dynamic env flip cannot bypass the active-tier precondition
+        (per spec v1.4 §4.2). Returns the composite's own holder
+        when the delegates lack the attribute.
+        """
+        return getattr(self, "_compaction_fence_mode", None)
 
     def get_recent_canonical_turns(
         self,
@@ -696,6 +738,9 @@ class CompositeStore:
 
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return self._search.get_all_chunk_embeddings()
+
+    def has_chunks_for_segment(self, segment_ref: str) -> bool:
+        return self._search.has_chunks_for_segment(segment_ref)
 
     def store_canonical_turn_chunk_embeddings(
         self,
@@ -1156,6 +1201,52 @@ class CompositeStore:
         if callable(fn):
             return list(fn(grace_s=grace_s))
         return []
+
+    def find_compaction_backlog_conversations(
+        self, *, min_backlog_turns: int, grace_s: float, limit: int,
+    ) -> list["BacklogCandidate"]:
+        """Forwarder per compaction-backlog sweeper spec v1.4 §3.1.
+        Returns empty list (NOT None) when the underlying store lacks
+        the method, matching the existing sweeper forwarder shape so
+        cloud's tick loop can iterate the result without a None check.
+        """
+        fn = getattr(
+            self._segments, "find_compaction_backlog_conversations", None,
+        )
+        if callable(fn):
+            return list(fn(
+                min_backlog_turns=min_backlog_turns,
+                grace_s=grace_s,
+                limit=limit,
+            ))
+        return []
+
+    def claim_compaction_backlog(
+        self,
+        *,
+        candidate: "BacklogCandidate",
+        new_operation_id: str,
+        owner_worker_id: str,
+        phase_count: int,
+        min_backlog_turns: int,
+        grace_s: float,
+    ) -> bool:
+        """Forwarder per compaction-backlog sweeper spec v1.4 §3.2.
+        Returns False when the underlying store lacks the method so
+        cloud's tick loop can treat the claim as lost without
+        special-casing the legacy store path.
+        """
+        fn = getattr(self._segments, "claim_compaction_backlog", None)
+        if callable(fn):
+            return bool(fn(
+                candidate=candidate,
+                new_operation_id=new_operation_id,
+                owner_worker_id=owner_worker_id,
+                phase_count=phase_count,
+                min_backlog_turns=min_backlog_turns,
+                grace_s=grace_s,
+            ))
+        return False
 
     def find_idle_deletable_conversations(
         self, *, max_msgs: int, min_age_s: float, limit: int = 1000,

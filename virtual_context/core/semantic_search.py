@@ -175,14 +175,23 @@ class SemanticSearchManager:
         if embed_fn is None:
             return
         if disable_replacement_passes:
-            existing = [
-                c for c in self._store.get_all_chunk_embeddings()
-                if c.segment_ref == stored.ref
-            ]
-            if existing:
+            # Single-row probe on segment_chunks(segment_ref) replaces
+            # the previous O(N) ``get_all_chunk_embeddings`` scan that
+            # filtered by ref in Python. Backends override
+            # ``has_chunks_for_segment`` with a ``LIMIT 1`` SELECT; the
+            # default falls back to the scan so non-backend stores
+            # stay functional. Per codex P5 follow-up.
+            #
+            # Log shape preserves the pre-cleanup ``(%d pre-existing
+            # chunks)`` field so downstream log parsers / dashboards
+            # do not regress. The probe itself is boolean so we cannot
+            # report the actual count without a second query; ``>=1``
+            # is the closest faithful value at no additional cost.
+            if self._store.has_chunks_for_segment(stored.ref):
                 logger.info(
                     "C2R gate: skipping chunk embedding write for segment %s "
-                    "(%d pre-existing chunks)", stored.ref, len(existing),
+                    "(%s pre-existing chunks)",
+                    stored.ref, ">=1",
                 )
                 return
         chunks = chunk_segment_text(stored.full_text)

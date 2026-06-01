@@ -196,22 +196,44 @@ def _walk_functions(tree: ast.Module):
 
 
 # Captures any SQL fragment that writes ``conversations.phase``. The
-# pattern is permissive (any whitespace around ``=``) so it catches
-# both UPSERT (``SET phase = X``) and bulk-rewrite forms.
+# pattern is anchored on the ``conversations`` table token so a
+# ``SET phase = X`` write against an unrelated table does not trip
+# the rule. Both UPDATE bulk-rewrite forms and ON CONFLICT DO UPDATE
+# SET forms are covered; the latter relies on the surrounding INSERT
+# referencing ``conversations`` as the target table.
 _PHASE_WRITE_RE = re.compile(
     r"""
-    (?:                              # opening token of the write
-        UPDATE\s+conversations\b     # bare UPDATE
-        | SET\b                      # or a SET inside ON CONFLICT DO UPDATE
+    (?:
+        # Bulk-rewrite form: ``UPDATE conversations SET ... phase = X``
+        UPDATE\s+conversations\b
+        (?:(?!\bWHERE\b)[\s\S])*?
+        \bSET\b
+        (?:(?!\bWHERE\b)[\s\S])*?
+        \bphase\s*=\s*
+        (?:%s|\?|'\w+')
+        |
+        # UPSERT form: ``INSERT INTO conversations ... ON CONFLICT ...
+        # DO UPDATE SET ... phase = X``. The ``conversations`` token
+        # appears before the SET clause.
+        INSERT\s+INTO\s+conversations\b
+        [\s\S]*?
+        \bON\s+CONFLICT\b
+        [\s\S]*?
+        \bDO\s+UPDATE\s+SET\b
+        (?:(?!\bWHERE\b)[\s\S])*?
+        \bphase\s*=\s*
+        (?:%s|\?|'\w+')
     )
-    [\s\S]*?                         # arbitrary SQL between
-    \bphase\s*=\s*                   # the write predicate
-    (?:%s|\?|'\w+')                  # bind placeholder or literal
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
 
+# Matches the literal ``'queued'`` or ``'running'`` status values
+# inside the VALUES tuple of a ``compaction_operation`` INSERT.
+# Active-row inserts are the ones protected by the partial unique
+# index ``idx_compaction_operation_active``; the inspector enforces a
+# tighter allowlist on those than on completed/abandoned inserts.
 _ACTIVE_STATUS_RE = re.compile(
     r"VALUES\s*\([^)]*'(?:queued|running)'", re.IGNORECASE,
 )
@@ -242,18 +264,46 @@ def _function_inserts_active_compaction_op(fn: ast.FunctionDef) -> bool:
     return False
 
 
+# Names whose presence in the first prefix of a function body counts
+# as "the validator was invoked before any DB-touching work."
+# ``_validate_compaction_guard_kwargs`` is the only module-level
+# guard validator; the position check rejects functions that hide
+# the call after an INSERT or UPDATE.
+_VALIDATOR_NAME = "_validate_compaction_guard_kwargs"
+
+
 def _function_has_validator_call(fn: ast.FunctionDef) -> bool:
-    """Return True iff the body contains a direct call to
-    ``_validate_compaction_guard_kwargs(...)``. The helper is a
-    module-level function (not a method) so the call appears as
-    ``Call(func=Name(id='_validate_compaction_guard_kwargs'), ...)``.
+    """Return True iff the validator is called BEFORE any
+    DB-touching statement in the function body.
+
+    The first prefix of ``fn.body`` is scanned linearly: a top-level
+    import statement, a docstring, and any assignments / Expr lines
+    that do not include a ``conn.execute`` / ``cur.execute`` /
+    ``conn.transaction`` call are skipped. The first statement that
+    either (a) contains the validator call -> True, or (b) contains
+    a DB-touching call -> False. This rejects a function that places
+    the validator at the bottom of its body after the writes have
+    already fired.
     """
-    for child in ast.walk(fn):
-        if isinstance(child, ast.Call):
-            func = child.func
-            if (isinstance(func, ast.Name)
-                    and func.id == "_validate_compaction_guard_kwargs"):
+    db_call_attrs = frozenset({"execute", "executemany", "transaction"})
+
+    for stmt in fn.body:
+        calls = [
+            child for child in ast.walk(stmt)
+            if isinstance(child, ast.Call)
+        ]
+        calls.sort(
+            key=lambda call: (
+                getattr(call, "lineno", 0),
+                getattr(call, "col_offset", 0),
+            )
+        )
+        for call in calls:
+            func = call.func
+            if isinstance(func, ast.Name) and func.id == _VALIDATOR_NAME:
                 return True
+            if isinstance(func, ast.Attribute) and func.attr in db_call_attrs:
+                return False
     return False
 
 
@@ -438,34 +488,121 @@ def test_compaction_callsite_guard_kwargs(path):
 
 
 # ---------------------------------------------------------------------------
-# T6.5: EXCLUDED_COMPACTION_WRITES -- _run_compaction does not call
-# methods that the fence does not yet cover.
+# T6.5: EXCLUDED_COMPACTION_WRITES -- _run_compaction AND every
+# helper method it can reach do not call methods that the fence does
+# not yet cover. The recursive closure catches a stealth write that
+# hides inside ``_compact_and_store`` / ``_build_tag_summaries`` /
+# ``_propagate_tool_output_links`` etc.
 # ---------------------------------------------------------------------------
 
 
-def test_excluded_compaction_writes_not_in_run_compaction():
+def _collect_self_method_names_called(fn: ast.FunctionDef) -> set[str]:
+    """Return the set of ``self.<name>`` method names invoked anywhere
+    inside ``fn``. Used to build the call closure rooted at
+    ``_run_compaction``.
+    """
+    out: set[str] = set()
+    for child in ast.walk(fn):
+        if isinstance(child, ast.Call):
+            func = child.func
+            if (isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and func.value.id == "self"):
+                out.add(func.attr)
+    return out
+
+
+def _build_self_method_map(tree: ast.Module) -> dict[str, ast.FunctionDef]:
+    """Map every method defined in ``tree`` (at one class level deep)
+    to its ``FunctionDef`` node, keyed by bare method name.
+    """
+    out: dict[str, ast.FunctionDef] = {}
+    for qualname, fn in _walk_functions(tree):
+        out[qualname] = fn
+    return out
+
+
+def _closure_from(root_name: str, method_map: dict[str, ast.FunctionDef]) -> set[str]:
+    """Compute the transitive set of self-method names reachable from
+    ``root_name`` inside ``method_map``. External calls (anything not
+    a ``self.<name>`` invocation, or names not defined in ``tree``)
+    are ignored.
+    """
+    if root_name not in method_map:
+        return set()
+    seen: set[str] = {root_name}
+    frontier = [root_name]
+    while frontier:
+        current = frontier.pop()
+        for callee in _collect_self_method_names_called(method_map[current]):
+            if callee in method_map and callee not in seen:
+                seen.add(callee)
+                frontier.append(callee)
+    return seen
+
+
+def test_excluded_compaction_writes_not_in_run_compaction_closure():
     tree = _parse(_PIPELINE)
-    run_compaction = None
-    for child in ast.walk(tree):
-        if (isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and child.name == "_run_compaction"):
-            run_compaction = child
-            break
-    assert run_compaction is not None, (
+    method_map = _build_self_method_map(tree)
+    assert "_run_compaction" in method_map, (
         "_run_compaction not found in compaction_pipeline.py -- the "
         "inspector cannot verify the excluded-writes contract."
     )
+    closure = _closure_from("_run_compaction", method_map)
+    assert closure, "closure walk produced an empty set"
+
     offenders: list[str] = []
-    for call, target in _iter_calls_to(
-        ast.Module(body=[run_compaction], type_ignores=[]),
-        EXCLUDED_COMPACTION_WRITES,
-    ):
-        offenders.append(f"{target} (line {call.lineno})")
+    for name in sorted(closure):
+        fn = method_map[name]
+        for call, target in _iter_calls_to(
+            ast.Module(body=[fn], type_ignores=[]),
+            EXCLUDED_COMPACTION_WRITES,
+        ):
+            offenders.append(
+                f"{target} in {name} (line {call.lineno})"
+            )
     assert not offenders, (
-        f"_run_compaction reaches excluded methods: {offenders}. If a "
-        f"new compaction path needs to write these tables, update "
-        f"schema, cleanup predicates, callsite kwarg propagation, and "
-        f"tests in the same change."
+        f"_run_compaction call closure reaches excluded methods: "
+        f"{offenders}. If a new compaction path needs to write these "
+        f"tables, update schema, cleanup predicates, callsite kwarg "
+        f"propagation, and tests in the same change."
+    )
+
+
+# ---------------------------------------------------------------------------
+# T6.5b: ACTIVE_OP_INSERT subset -- any function that inserts an
+# active-status (queued / running) compaction_operation row must be
+# in the strict allowlist below. This is tighter than the broader
+# any-INSERT check because active inserts collide with the partial
+# unique index ``idx_compaction_operation_active`` and so directly
+# affect the at-most-one-active invariant.
+# ---------------------------------------------------------------------------
+
+
+ACTIVE_STATUS_INSERT_ALLOWLIST = frozenset({
+    "begin_compaction_with_lock",
+    "cleanup_abandoned_compaction",
+    # Legacy/test helper -- still tolerated, see commentary on
+    # ACTIVE_OP_INSERT_ALLOWLIST above.
+    "start_compaction_operation",
+})
+
+
+@pytest.mark.parametrize("backend_path", [_PG, _SQ], ids=["postgres", "sqlite"])
+def test_active_status_compaction_insert_allowlist(backend_path):
+    tree = _parse(backend_path)
+    offenders: list[str] = []
+    for qualname, fn in _walk_functions(tree):
+        if (_function_inserts_active_compaction_op(fn)
+                and qualname not in ACTIVE_STATUS_INSERT_ALLOWLIST):
+            offenders.append(qualname)
+    assert not offenders, (
+        f"{backend_path.name}: functions inserting active-status "
+        f"compaction_operation rows (queued / running) outside the "
+        f"strict allowlist: {sorted(offenders)}. Active rows collide "
+        f"with idx_compaction_operation_active and so the inspector "
+        f"requires them to route through one of: "
+        f"{sorted(ACTIVE_STATUS_INSERT_ALLOWLIST)}."
     )
 
 
@@ -499,6 +636,30 @@ class FakeStore:
         "Negative test failed: the inspector should have flagged "
         f"`malicious_phase_write` but reported {offenders}. The rule "
         "is silently dormant if this fires."
+    )
+
+
+def test_phase_writer_inspector_ignores_where_only_phase_predicate():
+    """A conversation UPDATE that only reads phase in the predicate
+    must not count as a phase write.
+    """
+    synthetic = """
+class FakeStore:
+    def touch_conversation_if_compacting(self, conn, conv_id):
+        conn.execute(
+            "UPDATE conversations SET updated_at = %s "
+            "WHERE conversation_id = %s AND phase = %s",
+            ("now", conv_id, "compacting"),
+        )
+"""
+    tree = ast.parse(synthetic)
+    offenders: list[str] = []
+    for qualname, fn in _walk_functions(tree):
+        if _function_writes_phase(fn) and qualname not in PHASE_WRITER_ALLOWLIST:
+            offenders.append(qualname)
+    assert offenders == [], (
+        "Negative test failed: the inspector treated a WHERE-only "
+        f"phase predicate as a conversations.phase write: {offenders}."
     )
 
 
@@ -549,6 +710,33 @@ class FakeStore:
     assert not _function_has_validator_call(found_store_facts[0]), (
         "Negative test failed: the synthetic store_facts shouldn't "
         "appear to call the validator. The detector is too permissive."
+    )
+
+
+def test_op_fence_inspector_rejects_validator_after_write():
+    """Negative for validator position: a fenced method with a
+    DB-touching call before the validator must fail even when both
+    calls live inside the same top-level block.
+    """
+    synthetic = """
+class FakeStore:
+    def store_facts(self, conn, facts, *, operation_id=None,
+                    owner_worker_id=None, lifecycle_epoch=None):
+        with conn.transaction():
+            conn.execute("INSERT INTO facts (id) VALUES (%s)", ("f1",))
+            _validate_compaction_guard_kwargs(
+                operation_id, owner_worker_id, lifecycle_epoch,
+            )
+"""
+    tree = ast.parse(synthetic)
+    found_store_facts: list[ast.FunctionDef] = []
+    for qualname, fn in _walk_functions(tree):
+        if qualname == "store_facts":
+            found_store_facts.append(fn)
+    assert len(found_store_facts) == 1
+    assert not _function_has_validator_call(found_store_facts[0]), (
+        "Negative test failed: a validator hidden after a DB write "
+        "must not satisfy the op-fence position rule."
     )
 
 

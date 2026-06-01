@@ -284,6 +284,73 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# SQLite analog of the Postgres ``_BACKLOG_DETECTION_SQL`` per
+# compaction-backlog sweeper spec v1.4 §3.1. SQLite has no
+# ``make_interval`` so the grace cutoff uses ``julianday('now', '-' ||
+# ? || ' seconds')`` and the terminal timestamp is compared through
+# ``julianday(...)``. Parameter style is positional ``?`` (matching the
+# existing ``conn.execute(sql, tuple)`` calls in this file) rather than
+# psycopg's named ``%(name)s``.
+_BACKLOG_DETECTION_SQL_SQLITE = """
+WITH backlog AS (
+  SELECT ct.conversation_id, COUNT(*) AS backlog_turns
+    FROM canonical_turns ct
+   WHERE ct.tagged_at IS NOT NULL
+     AND ct.compacted_at IS NULL
+   GROUP BY ct.conversation_id
+  HAVING COUNT(*) >= ?
+),
+last_terminal AS (
+  -- ``MAX(...)`` on a TEXT timestamp compares lexicographically and
+  -- so can pick the wrong row when a conversation has terminal ops
+  -- stored in mixed formats (some ISO ``T``-separated with ``+00:00``
+  -- suffix, some SQLite's space-separated UTC). ``datetime(...)``
+  -- normalizes both forms to the SQLite canonical
+  -- ``YYYY-MM-DD HH:MM:SS`` shape so the text MAX is comparable +
+  -- correct. The grace-window WHERE clause below then operates on
+  -- the right row even under mixed-format histories. Per codex
+  -- sweeper Phase 0 P2 finding.
+  SELECT co.conversation_id, co.lifecycle_epoch,
+         MAX(datetime(COALESCE(co.completed_at, co.started_at)))
+           AS last_terminal_at
+    FROM compaction_operation co
+   WHERE co.status IN ('completed', 'failed', 'abandoned', 'cancelled')
+   GROUP BY co.conversation_id, co.lifecycle_epoch
+)
+SELECT c.conversation_id, c.tenant_id, c.lifecycle_epoch,
+       b.backlog_turns,
+       lt.last_terminal_at AS last_terminal_compaction_at
+  FROM backlog b
+  JOIN conversations c
+    ON c.conversation_id = b.conversation_id
+  LEFT JOIN last_terminal lt
+    ON lt.conversation_id = b.conversation_id
+   AND lt.lifecycle_epoch = c.lifecycle_epoch
+ WHERE c.phase = 'active'
+   AND c.deleted_at IS NULL
+   AND NOT EXISTS (
+     SELECT 1
+       FROM canonical_turns ct_untagged
+      WHERE ct_untagged.conversation_id = c.conversation_id
+        AND ct_untagged.tagged_at IS NULL
+   )
+   AND NOT EXISTS (
+     SELECT 1
+       FROM compaction_operation co_live
+      WHERE co_live.conversation_id = c.conversation_id
+        AND co_live.lifecycle_epoch = c.lifecycle_epoch
+        AND co_live.status IN ('queued', 'running')
+   )
+   AND (
+     lt.last_terminal_at IS NULL
+     OR julianday(lt.last_terminal_at)
+        < julianday('now', '-' || ? || ' seconds')
+   )
+ ORDER BY b.backlog_turns DESC
+ LIMIT ?
+"""
+
+
 def _validate_compaction_guard_kwargs(
     operation_id: str | None,
     owner_worker_id: str | None,
@@ -3299,6 +3366,96 @@ CREATE TABLE IF NOT EXISTS request_captures (
             })
         return out
 
+    def claim_compaction_backlog(
+        self,
+        *,
+        candidate: "BacklogCandidate",
+        new_operation_id: str,
+        owner_worker_id: str,
+        phase_count: int,
+        min_backlog_turns: int,
+        grace_s: float,
+    ) -> bool:
+        """SQLite mirror of the Postgres adapter. See the PG docstring
+        for the full contract. Both adapters share the predicate
+        verifier exposed by ``virtual_context.core.sweeper_backlog``
+        so the predicate set lives in one backend-agnostic helper
+        and the SQLite path does not pull in psycopg.
+        """
+        from ..core.sweeper_backlog import (
+            verify_backlog_candidate_under_lock as _verify,
+        )
+
+        def pre_begin_check(conn) -> bool:
+            return _verify(
+                conn=conn,
+                candidate=candidate,
+                min_backlog_turns=min_backlog_turns,
+                grace_s=grace_s,
+                placeholder="?",
+            )
+
+        return self.begin_compaction_with_lock(
+            conversation_id=candidate.conversation_id,
+            lifecycle_epoch=candidate.lifecycle_epoch,
+            worker_id=owner_worker_id,
+            new_operation_id=new_operation_id,
+            phase_count=phase_count,
+            phase_name="starting",
+            required_phase="active",
+            pre_begin_check=pre_begin_check,
+        )
+
+    def find_compaction_backlog_conversations(
+        self,
+        *,
+        min_backlog_turns: int,
+        grace_s: float,
+        limit: int,
+    ) -> list["BacklogCandidate"]:
+        """SQLite mirror of the Postgres detection query per
+        compaction-backlog sweeper spec v1.4 §3.1. Substitutions from
+        the PG path:
+
+        * ``make_interval(secs => %(grace_s)s)`` becomes a
+          ``julianday('now', '-' || ? || ' seconds')`` cutoff compared
+          against ``julianday(last_terminal_at)``.
+        * Named ``%(name)s`` parameters become positional ``?``.
+        * ``MAX(COALESCE(co.completed_at, co.started_at))`` keeps the
+          same shape; SQLite supports both functions.
+        * ``NOT EXISTS`` subqueries are identical.
+
+        Production runs Postgres; SQLite parity catches regressions
+        in tests. Returns the same ``BacklogCandidate`` shape so
+        upstream consumers stay backend-agnostic.
+        """
+        from datetime import datetime
+        from ..types import BacklogCandidate
+        conn = self._get_conn()
+        rows = conn.execute(
+            _BACKLOG_DETECTION_SQL_SQLITE,
+            (int(min_backlog_turns), float(grace_s), int(limit)),
+        ).fetchall()
+        out: list[BacklogCandidate] = []
+        for r in rows:
+            ts_raw = r["last_terminal_compaction_at"]
+            ts: datetime | None
+            if ts_raw is None or ts_raw == "":
+                ts = None
+            else:
+                try:
+                    ts = datetime.fromisoformat(str(ts_raw))
+                except ValueError:
+                    ts = None
+            out.append(BacklogCandidate(
+                conversation_id=str(r["conversation_id"]),
+                tenant_id=str(r["tenant_id"] or ""),
+                lifecycle_epoch=int(r["lifecycle_epoch"]),
+                backlog_turns=int(r["backlog_turns"]),
+                last_terminal_compaction_at=ts,
+            ))
+        return out
+
     def find_idle_deletable_conversations(
         self,
         *,
@@ -5381,6 +5538,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
             and lifecycle_epoch is not None
             and conversation_id is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so the method takes
+        # the legacy unguarded SQL path with no operation_id stamp,
+        # matching pre-fence behavior. The ACTIVE tier keeps the
+        # guarded path with its raise-on-mismatch contract. Per
+        # fencing plan §9.1 + the spec's rollout discipline: OFF is
+        # a kill switch that must produce legacy behavior, not a
+        # soft-drop of the mismatched write.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -5447,6 +5613,20 @@ CREATE TABLE IF NOT EXISTS request_captures (
             )
             for row in rows
         ]
+
+    def has_chunks_for_segment(self, segment_ref: str) -> bool:
+        """Single-row probe replacing the O(N)
+        ``get_all_chunk_embeddings`` scan that the C2R gate
+        previously used. ``LIMIT 1`` short circuits on the
+        ``segment_chunks(segment_ref, chunk_index)`` primary key.
+        """
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT 1 FROM segment_chunks WHERE segment_ref = ? LIMIT 1",
+            (segment_ref,),
+        ).fetchone()
+        return row is not None
+
 
     def store_canonical_turn_chunk_embeddings(
         self,
@@ -6600,6 +6780,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so ``store_facts``
+        # takes the legacy unguarded INSERT OR REPLACE path with no
+        # operation_id stamp. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
 
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -7062,6 +7247,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``set_fact_superseded`` takes the legacy unguarded UPDATE
+        # path. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         conn = self._get_conn()
         if guard_all:
             cur = conn.execute(
@@ -7127,6 +7317,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``update_fact_fields`` takes the legacy unguarded UPDATE
+        # path. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         conn = self._get_conn()
         if guard_all:
             cur = conn.execute(
@@ -7233,6 +7428,11 @@ CREATE TABLE IF NOT EXISTS request_captures (
             and lifecycle_epoch is not None
             and conversation_id is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so ``store_fact_links``
+        # takes the legacy unguarded INSERT OR REPLACE path with no
+        # operation_id stamp. Per fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         conn = self._get_conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -7621,6 +7821,12 @@ CREATE TABLE IF NOT EXISTS request_captures (
             and owner_worker_id is not None
             and lifecycle_epoch is not None
         )
+        # OFF/OBSERVE tier downgrades the guard so
+        # ``link_segment_tool_output`` takes the legacy unguarded
+        # INSERT OR IGNORE path with no operation_id stamp. Per
+        # fencing plan §9.1 OFF kill switch.
+        if guard_all and not self._compaction_fence_mode.enforces:
+            guard_all = False
         conn = self._get_conn()
         if guard_all:
             cur = conn.execute(

@@ -6,7 +6,24 @@ from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 
-from ..types import ChunkEmbedding, CompactionLeaseClaim, ConversationStats, DepthLevel, EngineStateSnapshot, Fact, FactSignal, CanonicalTurnChunkEmbedding, CanonicalTurnRow, QuoteResult, StoredSegment, StoredSummary, TagStats, TagSummary, WorkingSetEntry
+from ..types import (
+    CanonicalTurnChunkEmbedding,
+    CanonicalTurnRow,
+    ChunkEmbedding,
+    CompactionLeaseClaim,
+    ConversationStats,
+    DepthLevel,
+    EngineStateSnapshot,
+    Fact,
+    FactSignal,
+    Message,
+    QuoteResult,
+    StoredSegment,
+    StoredSummary,
+    TagStats,
+    TagSummary,
+    WorkingSetEntry,
+)
 from .progress_snapshot import ProgressSnapshot
 
 
@@ -226,6 +243,21 @@ class ContextStore(ABC):
     def get_all_chunk_embeddings(self) -> list[ChunkEmbedding]:
         return []
 
+    def has_chunks_for_segment(self, segment_ref: str) -> bool:
+        """Return True iff at least one chunk embedding row exists
+        for ``segment_ref``. Used by the C2R gate in
+        ``SemanticSearchManager.embed_and_store_chunks`` to decide
+        whether to skip the DELETE-then-INSERT under
+        ``disable_replacement_passes=True``. The default
+        implementation falls back to the O(N) ``get_all_chunk_embeddings``
+        scan so non-backend SearchStore implementations stay
+        functional; backends override with a single-row probe.
+        """
+        for chunk in self.get_all_chunk_embeddings():
+            if chunk.segment_ref == segment_ref:
+                return True
+        return False
+
     def store_canonical_turn_chunk_embeddings(
         self,
         conversation_id: str,
@@ -332,6 +364,51 @@ class ContextStore(ABC):
         if protected_recent_turns > 0:
             return []
         return rows
+
+    def reconstruct_history_for_conv(
+        self, conversation_id: str,
+    ) -> list[Message]:
+        """Reconstruct the full canonical history for a conversation
+        as a list of ``virtual_context.types.Message`` instances,
+        suitable for handing to ``_run_compact`` as the
+        ``conversation_history`` argument.
+
+        Per compaction-backlog sweeper spec v1.4 §5.2: includes BOTH
+        previously compacted canonical rows (so the dispatched
+        recovery compaction does not silently truncate engine state
+        to only the backlog-window rows) AND current uncompacted
+        tagged rows. Each canonical row becomes a pair of
+        ``Message(role='user', ...)`` + ``Message(role='assistant',
+        ...)``. Rows missing assistant content are skipped so an
+        incomplete trailing turn group cannot land in the history.
+
+        Rows are pulled via ``get_all_canonical_turns`` in canonical
+        sort-key order; backends may override for an indexed read
+        but the contract is identical.
+        """
+        rows = self.get_all_canonical_turns(conversation_id)
+        history: list[Message] = []
+        for row in rows:
+            user_text = row.user_content or ""
+            asst_text = row.assistant_content or ""
+            if not asst_text.strip():
+                # Incomplete trailing turn group; per the spec, only
+                # canonical rows with an assistant message land in
+                # the reconstructed history.
+                continue
+            history.append(Message(role="user", content=user_text))
+            history.append(Message(role="assistant", content=asst_text))
+        return history
+
+    def get_compaction_fence_mode(self):
+        """Return the runtime compaction-fence holder pinned at
+        store construction. Per compaction-backlog sweeper spec
+        v1.4 §4.2, cloud's sweeper tick reads this accessor (rather
+        than ``os.environ``) so a dynamic env flip cannot bypass the
+        active-tier precondition. Default returns ``None`` for
+        legacy stores that do not carry the holder.
+        """
+        return getattr(self, "_compaction_fence_mode", None)
 
     def mark_canonical_turns_tagged(
         self,
