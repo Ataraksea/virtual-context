@@ -7,7 +7,7 @@
 
 version: "0.2"
 storage_root: ".virtualcontext"
-context_window: 120000
+context_window: 64000
 token_counter: "estimate"
 
 paging:
@@ -18,14 +18,15 @@ paging:
 
 tag_generator:
   type: "llm"
-  provider: "local"
-  model: "qwen3:4b-instruct-2507-fp16"
+  provider: "gcp"
+  model: "google/gemini-3.5-flash"
   max_tags: 10
   min_tags: 5
   max_tokens: 8192
   prompt_mode: "compact"
   context_lookback_pairs: 5
   context_bleed_threshold: 0.1
+  temporal_heuristic_enabled: true
   keyword_fallback:
     tag_keywords:
       legal: [court, filing, motion, attorney, judge, case]
@@ -61,15 +62,18 @@ compaction:
   llm_token_overhead: 2000
 
 summarization:
-  provider: "local"
-  model: "qwen3:4b-instruct-2507-fp16"
+  provider: "gcp"
+  model: "google/gemini-3.5-flash"
   max_tokens: 1000
   temperature: 0.3
 
 providers:
-  local:
+  # gcp1:
+  #   type: "generic_openai"
+  #   base_url: "https://mg-endpoint-2bc79fa0-6992-4850-9895-c61fab75ac25.us-central1-72655193974.prediction.vertexai.goog/v1"
+  gcp:
     type: "generic_openai"
-    base_url: "http://127.0.0.1:11434/v1"
+    base_url: "https://aiplatform.googleapis.com/v1"
 
 storage:
   backend: "sqlite"
@@ -79,13 +83,34 @@ storage:
 facts:
   graph_links: true
 
+supersession:
+  enabled: true
+  provider: "gcp"
+  model: "google/gemini-3.5-flash"
+  batch_size: 20
+
+curation:
+  enabled: true
+  provider: "gcp"
+  model: "google/gemini-3.5-flash"
+  max_response_tokens: 2048
+
+tool_output:
+  enabled: true
+  default_truncate_threshold: 8192
+  max_index_bytes: 524288
+  default_head_ratio: 0.6
+  default_tail_ratio: 0.4
+
 assembly:
   core_context_max_tokens: 18000
   tag_context_max_tokens: 30000
   facts_max_tokens: 20000
   context_hint_enabled: true
   context_hint_max_tokens: 2000
-  core_files: []
+  core_files:
+    - path: "SOUL.md"
+      priority: 10
 
 retrieval:
   skip_active_tags: true
@@ -101,5 +126,5 @@ retrieval:
       include_related: true
 
 telemetry:
-  enabled: true
+  enabled: false
   models_file: "models.yaml"

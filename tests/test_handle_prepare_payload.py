@@ -305,10 +305,27 @@ def test_phase_gate_compacting_widens_pending_and_returns(tmp_path):
     try:
         conv_id = state.engine.config.conversation_id
         inner = _inner_store(state.engine)
-        # Force phase='compacting'.
+        # Force phase='compacting' WITH a live compaction_operation row.
+        # A legitimate compacting conversation always has an active op row;
+        # the orphan-compacting repair in handle_prepare_payload self-heals
+        # phase='compacting' WITHOUT one back to 'active', so seeding the row
+        # (and claiming ownership) is required to exercise the real
+        # widen-and-return path this test targets.
+        from virtual_context.core.canonical_turns import utcnow_iso
         inner.set_phase(
             conversation_id=conv_id, lifecycle_epoch=1, phase="compacting",
         )
+        now = utcnow_iso()
+        with inner._get_conn() as conn:
+            conn.execute(
+                """INSERT INTO compaction_operation
+                   (operation_id, conversation_id, lifecycle_epoch,
+                    phase_index, phase_count, phase_name, status,
+                    started_at, heartbeat_ts, owner_worker_id, created_at)
+                   VALUES (?, ?, 1, 0, 7, 'starting', 'running', ?, ?, ?, ?)""",
+                ("live-op-xyz", conv_id, now, now, state._worker_id, now),
+            )
+        state._active_compaction_op = "live-op-xyz"
         decision = state.handle_prepare_payload(
             body={"messages": [{"role": "user", "content": "hi"}]},
             payload_accounting={
