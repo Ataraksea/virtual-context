@@ -19,12 +19,17 @@ class GenericOpenAIProvider(BaseProvider):
         model: str = "qwen3:4b-instruct-2507-fp16",
         temperature: float = 0.3,
         api_key: str = "not-needed",
+        extra_body: dict | None = None,
     ) -> None:
         super().__init__()
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.temperature = temperature
         self.api_key = api_key
+        # Extra top-level payload fields merged into every request body. Used to
+        # pass provider-specific knobs such as ``reasoning_effort`` (Gemini /
+        # OpenAI thinking models) or vendor ``extra_body`` options.
+        self.extra_body = extra_body or {}
 
     def _provider_name(self) -> str:
         return "generic_openai"
@@ -56,6 +61,8 @@ class GenericOpenAIProvider(BaseProvider):
             payload["max_completion_tokens"] = max_tokens
         else:
             payload["max_tokens"] = max_tokens
+        if self.extra_body:
+            payload.update(self.extra_body)
         return payload
 
     def _extract_text(self, data: dict) -> str:

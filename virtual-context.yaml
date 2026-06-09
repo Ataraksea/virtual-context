@@ -18,7 +18,7 @@ paging:
 
 tag_generator:
   type: "llm"
-  provider: "gcp"
+  provider: "vertex_flush_memories"  # ↔ Hermes auxiliary.flush_memories
   model: "google/gemini-3.5-flash"
   max_tags: 10
   min_tags: 5
@@ -62,18 +62,49 @@ compaction:
   llm_token_overhead: 2000
 
 summarization:
-  provider: "gcp"
+  provider: "vertex_compression"  # ↔ Hermes auxiliary.compression
   model: "google/gemini-3.5-flash"
   max_tokens: 1000
   temperature: 0.3
 
 providers:
-  # gcp1:
-  #   type: "generic_openai"
-  #   base_url: "https://mg-endpoint-2bc79fa0-6992-4850-9895-c61fab75ac25.us-central1-72655193974.prediction.vertexai.goog/v1"
-  gcp:
-    type: "generic_openai"
-    base_url: "https://aiplatform.googleapis.com/v1"
+  # Google Vertex AI via its OpenAI-compatible endpoint. The base_url and the
+  # OAuth bearer token are derived automatically from the service-account JSON
+  # (project_id + a refreshed access token) — do NOT set base_url/api_key here.
+  #
+  # Each entry below mirrors a Hermes Agent auxiliary model type from
+  # config.yaml (auxiliary.*). They all currently point at the same model
+  # (google/gemini-3.5-flash) but carry that aux type's timeout, so individual
+  # VC components track the closest Hermes aux model. Change a model/timeout in
+  # one place to re-tune just that component.
+  # NOTE: gemini-3.5-flash is a "thinking" model — it spends output budget on
+  # reasoning tokens before answering. For these structured-JSON aux tasks that
+  # is wasted latency/cost (and can starve smaller token budgets), so each entry
+  # sets extra_body.reasoning_effort to keep thinking minimal.
+  vertex_flush_memories:   # ↔ auxiliary.flush_memories  (per-turn tag + fact extraction)
+    type: "vertex"
+    credentials_path: "D:/AppData/Local/hermes/janeagi-496912-d8d1d7f16e80.json"
+    region: "global"
+    model: "google/gemini-3.5-flash"
+    timeout: 30
+    extra_body:
+      reasoning_effort: "minimal"
+  vertex_compression:      # ↔ auxiliary.compression  (conversation summarization)
+    type: "vertex"
+    credentials_path: "D:/AppData/Local/hermes/janeagi-496912-d8d1d7f16e80.json"
+    region: "global"
+    model: "google/gemini-3.5-flash"
+    timeout: 30
+    extra_body:
+      reasoning_effort: "minimal"
+  vertex_curator:          # ↔ auxiliary.curator  (fact curation + supersession)
+    type: "vertex"
+    credentials_path: "D:/AppData/Local/hermes/janeagi-496912-d8d1d7f16e80.json"
+    region: "global"
+    model: "google/gemini-3.5-flash"
+    timeout: 600
+    extra_body:
+      reasoning_effort: "minimal"
 
 storage:
   backend: "sqlite"
@@ -85,13 +116,13 @@ facts:
 
 supersession:
   enabled: true
-  provider: "gcp"
+  provider: "vertex_curator"  # ↔ Hermes auxiliary.curator
   model: "google/gemini-3.5-flash"
   batch_size: 20
 
 curation:
   enabled: true
-  provider: "gcp"
+  provider: "vertex_curator"  # ↔ Hermes auxiliary.curator
   model: "google/gemini-3.5-flash"
   max_response_tokens: 2048
 
@@ -109,7 +140,7 @@ assembly:
   context_hint_enabled: true
   context_hint_max_tokens: 2000
   core_files:
-    - path: "SOUL.md"
+    - path: "D:/Documents/hermes/SOUL.md"
       priority: 10
 
 retrieval:

@@ -38,6 +38,7 @@ postgres = ["psycopg[binary]>=3.1", "psycopg-pool>=3.1"]
 neo4j = ["neo4j>=5.0"]
 falkordb = ["falkordb>=1.0"]
 redis = ["redis>=5.0"]
+vertex = ["google-auth>=2.0"]
 all = [
     "psycopg[binary]>=3.1",
     "psycopg-pool>=3.1",

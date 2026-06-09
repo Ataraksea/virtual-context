@@ -109,27 +109,40 @@ class BaseProvider(ABC):
             try:
                 resp = client.post(url, headers=headers, json=payload)
                 elapsed_ms = (time.time() - t0) * 1000
-                data = resp.json()
+                status = resp.status_code
 
-                if resp.status_code >= 400 or "error" in data:
-                    err_msg = str(data.get("error", f"HTTP {resp.status_code}"))[:500]
-                    status = resp.status_code
+                # Parse the body defensively. A non-2xx status often comes with
+                # an empty or HTML body (e.g. 401/403/404 from a misconfigured
+                # endpoint), which would otherwise blow up in resp.json() and be
+                # misreported as a "JSON decode error". Check status FIRST so the
+                # real HTTP failure — and whether it is retryable — is surfaced.
+                try:
+                    data = resp.json()
+                except (_json.JSONDecodeError, ValueError):
+                    data = None
+
+                if status >= 400 or not isinstance(data, dict) or "error" in data:
+                    if isinstance(data, dict):
+                        err_msg = str(data.get("error", f"HTTP {status}"))[:500]
+                    else:
+                        body_preview = (resp.text or "").strip()[:300]
+                        err_msg = f"HTTP {status} (non-JSON body): {body_preview!r}" if body_preview \
+                            else f"HTTP {status} (empty body)"
                     logger.warning("LLM API error: provider=%s model=%s %.0fms status=%d error=%.200s",
                                     self._provider_name(), model, elapsed_ms, status, err_msg)
-                    if status in (429, 500, 502, 503):
-                        last_error = LLMProviderError(
-                            f"API error: {err_msg}",
-                            provider=self._provider_name(),
-                            status_code=status,
-                        )
-                        if attempt < MAX_RETRIES - 1:
-                            time.sleep(RETRY_BACKOFF[attempt])
-                        continue
-                    raise LLMProviderError(
+                    # Retry only on transient server-side / rate-limit statuses.
+                    # 401/403/404/400 are configuration/auth errors that will
+                    # never succeed on retry, so fail fast.
+                    retryable = status in (429, 500, 502, 503, 504) or status == 0
+                    last_error = LLMProviderError(
                         f"API error: {err_msg}",
                         provider=self._provider_name(),
                         status_code=status,
                     )
+                    if retryable and attempt < MAX_RETRIES - 1:
+                        time.sleep(RETRY_BACKOFF[attempt])
+                        continue
+                    raise last_error
 
                 usage = data.get("usage", {})
                 self.last_usage = usage

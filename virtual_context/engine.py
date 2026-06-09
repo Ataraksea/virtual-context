@@ -739,7 +739,9 @@ class VirtualContextEngine:
         if self.config.tag_generator.type == "llm":
             provider_name = self.config.tag_generator.provider
             provider_config = self.config.providers.get(provider_name, {})
-            llm_provider = self._build_provider(provider_name, provider_config)
+            llm_provider = self._build_provider(
+                provider_name, provider_config, model=self.config.tag_generator.model,
+            )
             if llm_provider:
                 llm_provider._llm_log_path = getattr(self.config.proxy, "llm_calls_log", "") or ""
 
@@ -1026,7 +1028,9 @@ class VirtualContextEngine:
 
         provider_name = self.config.summarization.provider
         provider_config = self.config.providers.get(provider_name, {})
-        self._llm_provider = self._build_provider(provider_name, provider_config)
+        self._llm_provider = self._build_provider(
+            provider_name, provider_config, model=self.config.summarization.model,
+        )
         if self._llm_provider:
             self._llm_provider._llm_log_path = getattr(self.config.proxy, "llm_calls_log", "") or ""
 
@@ -2194,7 +2198,7 @@ class VirtualContextEngine:
         provider_name = sc.provider or self.config.summarization.provider
         model = sc.model or self.config.summarization.model
         provider_config = self.config.providers.get(provider_name, {})
-        llm = self._build_provider(provider_name, provider_config)
+        llm = self._build_provider(provider_name, provider_config, model=model)
         if not llm:
             logger.warning("Supersession enabled but provider '%s' could not be built", provider_name)
             return
@@ -2229,7 +2233,7 @@ class VirtualContextEngine:
         provider_name = cc.provider or self.config.summarization.provider
         model = cc.model or self.config.summarization.model
         provider_config = self.config.providers.get(provider_name, {})
-        llm = self._build_provider(provider_name, provider_config)
+        llm = self._build_provider(provider_name, provider_config, model=model)
         if not llm:
             logger.warning("Curation enabled but provider '%s' could not be built", provider_name)
             return
@@ -2242,12 +2246,44 @@ class VirtualContextEngine:
         )
         logger.info("Fact curator initialized (provider=%s, model=%s)", provider_name, model)
 
-    def _build_provider(self, provider_name: str, provider_config: dict):
+    def _build_provider(self, provider_name: str, provider_config: dict, model: str | None = None):
+        """Construct an LLM provider instance.
+
+        Parameters
+        ----------
+        model:
+            The model the *calling component* wants (e.g. ``tag_generator.model``).
+            Resolution order is: explicit ``model`` arg → provider block's
+            ``model`` → ``summarization.model``. Passing it here ensures each
+            component actually calls its configured model rather than silently
+            inheriting the summarizer's.
+        """
         ptype = provider_config.get("type", provider_name)
+
+        def _resolve_model() -> str:
+            return model or provider_config.get("model") or self.config.summarization.model
 
         # Backwards compat: bare "ollama" or "local" without explicit type → generic_openai
         if ptype in ("ollama", "local"):
             ptype = "generic_openai"
+
+        if ptype == "vertex":
+            from .providers.vertex import VertexProvider
+            try:
+                return VertexProvider(
+                    credentials_path=provider_config.get("credentials_path")
+                    or provider_config.get("service_account_file"),
+                    region=provider_config.get("region", "global"),
+                    model=_resolve_model(),
+                    temperature=self.config.summarization.temperature,
+                    timeout=provider_config.get("timeout", 30.0),
+                    extra_body=provider_config.get("extra_body"),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Vertex provider '%s' could not be built: %s", provider_name, e,
+                )
+                return None
 
         if ptype in ("generic_openai", "openrouter"):
             from .providers.generic_openai import GenericOpenAIProvider
@@ -2261,12 +2297,16 @@ class VirtualContextEngine:
             api_key = provider_config.get("api_key") or (
                 os.environ.get(api_key_env, "") if api_key_env else "not-needed"
             )
-            return GenericOpenAIProvider(
+            provider = GenericOpenAIProvider(
                 base_url=provider_config.get("base_url", default_url),
-                model=provider_config.get("model", self.config.summarization.model),
+                model=_resolve_model(),
                 temperature=self.config.summarization.temperature,
                 api_key=api_key,
+                extra_body=provider_config.get("extra_body"),
             )
+            if provider_config.get("timeout"):
+                provider._timeout = provider_config["timeout"]
+            return provider
 
         if ptype == "anthropic":
             api_key_env = provider_config.get("api_key_env", "ANTHROPIC_API_KEY")
@@ -2275,7 +2315,7 @@ class VirtualContextEngine:
                 from .providers.anthropic import AnthropicProvider
                 return AnthropicProvider(
                     api_key=api_key,
-                    model=provider_config.get("model", self.config.summarization.model),
+                    model=_resolve_model(),
                     temperature=self.config.summarization.temperature,
                 )
             logger.warning(
@@ -2287,7 +2327,7 @@ class VirtualContextEngine:
             from .providers.ollama_native import OllamaNativeProvider
             return OllamaNativeProvider(
                 base_url=provider_config.get("base_url", "http://127.0.0.1:11434"),
-                model=provider_config.get("model", self.config.summarization.model),
+                model=_resolve_model(),
                 temperature=self.config.summarization.temperature,
                 num_predict=provider_config.get("num_predict", 500),
                 force_json=provider_config.get("force_json", True),
