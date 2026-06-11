@@ -3760,8 +3760,17 @@ CREATE TABLE IF NOT EXISTS request_captures (
 
         TABLES_SIMPLE = (
             "segments", "canonical_turn_anchors", "canonical_turn_chunks",
-            "ingest_batches", "facts", "turn_tool_outputs",
-            "segment_tool_outputs", "chain_snapshots", "media_outputs",
+            "ingest_batches", "facts",
+            "segment_tool_outputs", "chain_snapshots",
+        )
+        # Tables whose natural key can legitimately collide across sibling
+        # conversations (overlapping re-ingest produces identical join /
+        # content-hash rows). Conflict resolution mirrors the tag tables:
+        # target wins, the source's conflicting rows are DELETEd and
+        # counted, the remainder moves.
+        TABLES_NATURAL_KEY_CONFLICT = (
+            ("turn_tool_outputs", ("turn_number", "tool_output_ref")),
+            ("media_outputs", ("ref",)),
         )
         TABLES_OFFSET_SORT_KEY = (("canonical_turns", "sort_key"),)
         TABLES_OFFSET_REQUEST_TURN = (
@@ -3985,6 +3994,29 @@ CREATE TABLE IF NOT EXISTS request_captures (
                     (target_conversation_id, source_conversation_id, source_conversation_id),
                 )
                 rows_moved[tbl] = cur.rowcount
+
+            # Natural-key conflict tables: drop source rows whose key
+            # already exists at target (bounded DELETE surface, target
+            # wins), then move the remainder.
+            for tbl, key_cols in TABLES_NATURAL_KEY_CONFLICT:
+                key_list = ", ".join(key_cols)
+                cur = conn.execute(
+                    f"DELETE FROM {tbl} "
+                    f" WHERE conversation_id = ? "
+                    f"   AND ({key_list}) IN "
+                    f"       (SELECT {key_list} FROM {tbl} WHERE conversation_id = ?)",
+                    (source_conversation_id, target_conversation_id),
+                )
+                deleted_conflicts = cur.rowcount
+                cur2 = conn.execute(
+                    f"UPDATE {tbl} "
+                    f"   SET conversation_id = ?, "
+                    f"       origin_conversation_id = COALESCE(NULLIF(origin_conversation_id, ''), ?) "
+                    f" WHERE conversation_id = ?",
+                    (target_conversation_id, source_conversation_id, source_conversation_id),
+                )
+                rows_moved[tbl] = cur2.rowcount
+                rows_moved[f"{tbl}__conflicts_deleted"] = deleted_conflicts
 
             # canonical_turns moves reset compacted_at = NULL so
             # target's compaction prefix invariant holds. The
@@ -6346,6 +6378,15 @@ CREATE TABLE IF NOT EXISTS request_captures (
         conversation_id: str,
     ) -> list[CanonicalTurnRow]:
         return self._load_canonical_turn_rows(conversation_id)
+
+    def count_canonical_turns(self, conversation_id: str) -> int:
+        """Indexed COUNT of canonical_turn rows under the literal id."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM canonical_turns WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     def get_uncompacted_canonical_turns(
         self,

@@ -23,11 +23,12 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 
 pytestmark = [
     pytest.mark.skipif(
-        not os.environ.get("DATABASE_URL"),
+        not pg_dsn(),
         reason="DATABASE_URL not set: Postgres smoke skipped",
     ),
     pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26"),
@@ -39,11 +40,11 @@ def pg_store():
     """Build a PostgresStore against DATABASE_URL. Cleanup teardown drops
     test rows under the test tenant prefix."""
     from virtual_context.storage.postgres import PostgresStore
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn)
     yield store
     try:
-        conn = store._get_conn()
+        conn = pg_test_conn()
         conn.execute("DELETE FROM conversations WHERE tenant_id LIKE 'pgbf-%' "
                      "OR conversation_id LIKE 'pgbf-%'")
         try:
@@ -81,7 +82,7 @@ def test_pg_backfill_populates_empty_tenant_id_from_cloud_conversations(pg_store
     tenant_id; matching cloud_conversations row with the right tenant_id).
     Run schema bootstrap; assert backfill populated the empty cell.
     """
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _ensure_cloud_conversations_table(conn)
 
     tid = f"pgbf-{uuid.uuid4().hex[:8]}"
@@ -114,7 +115,7 @@ def test_pg_backfill_populates_empty_tenant_id_from_cloud_conversations(pg_store
 def test_pg_backfill_is_idempotent(pg_store):
     """: second bootstrap run is a no-op (the WHERE filter on
     empty target makes the migration idempotent)."""
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _ensure_cloud_conversations_table(conn)
 
     tid = f"pgbf-{uuid.uuid4().hex[:8]}"
@@ -157,7 +158,7 @@ def test_pg_backfill_skips_when_cloud_conversations_absent(pg_store, tmp_path):
     backfill UPDATE: the missing-table raise rolls back ONLY the savepoint
     and leaves the outer schema bootstrap alive.
     """
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     # Drop cloud_conversations if it exists (simulating engine-only deploy).
     try:
         conn.execute("DROP TABLE IF EXISTS cloud_conversations")

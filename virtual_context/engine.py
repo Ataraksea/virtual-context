@@ -553,15 +553,34 @@ class VirtualContextEngine:
         # merge_audit FOR UPDATE row lock so the check fires
         # inside the same txn that moves the rows.
         inner = getattr(store, "_segments", store)
-        conn = inner._get_conn()
-        is_pg = "psycopg" in str(type(conn))
-        param = "%s" if is_pg else "?"
+        # Acquire a pre-check connection in a backend-portable way:
+        # pool-backed stores expose ``pool.connection()`` (and no
+        # ``_get_conn``); single-connection backends expose ``_get_conn``.
+        from contextlib import nullcontext
 
-        src_row = conn.execute(
-            f"SELECT tenant_id, lifecycle_epoch FROM conversations "
-            f"WHERE conversation_id = {param}",
-            (source_conversation_id,),
-        ).fetchone()
+        _pool = getattr(inner, "pool", None)
+        if _pool is not None:
+            _conn_cm = _pool.connection()
+        else:
+            _conn_cm = nullcontext(inner._get_conn())
+        with _conn_cm as conn:
+            is_pg = "psycopg" in str(type(conn))
+            param = "%s" if is_pg else "?"
+
+            src_row = conn.execute(
+                f"SELECT tenant_id, lifecycle_epoch FROM conversations "
+                f"WHERE conversation_id = {param}",
+                (source_conversation_id,),
+            ).fetchone()
+
+            # : target-tenant pre-check. Body's FOR UPDATE re-validation
+            # remains as Layer C; engine fail-fast catches the misroute at
+            # the cheapest layer (no transaction, no lock acquisition).
+            tgt_row = conn.execute(
+                f"SELECT tenant_id FROM conversations WHERE conversation_id = {param}",
+                (target_conversation_id,),
+            ).fetchone()
+
         if src_row is None:
             raise CrossTenantMergeError(
                 f"Source conversation {source_conversation_id} not found "
@@ -574,14 +593,6 @@ class VirtualContextEngine:
                 f"Source conversation {source_conversation_id} belongs to "
                 f"tenant '{src_tenant}', not '{tenant_id}'; refusing merge",
             )
-
-        # : target-tenant pre-check. Body's FOR UPDATE re-validation
-        # remains as Layer C; engine fail-fast catches the misroute at the
-        # cheapest layer (no transaction, no lock acquisition).
-        tgt_row = conn.execute(
-            f"SELECT tenant_id FROM conversations WHERE conversation_id = {param}",
-            (target_conversation_id,),
-        ).fetchone()
         if tgt_row is None:
             raise CrossTenantMergeError(
                 f"Target conversation {target_conversation_id} not found "
@@ -613,6 +624,42 @@ class VirtualContextEngine:
             source_label_at_merge=source_label_at_merge,
             cross_worker_invalidate=cross_worker_invalidate,
         )
+
+    def link_predecessor(
+        self,
+        predecessor_id: str,
+        stable_id: str,
+        *,
+        cross_worker_invalidate=None,
+    ) -> dict:
+        """Idempotently link a predecessor conversation to a stable id.
+
+        Thin engine entry over :func:`proxy.vcattach.link_predecessor` —
+        wires this engine's store and session-state provider; only the
+        cross-worker invalidation callback is caller-supplied. Returns
+        the result as a plain dict (metadata-safe): keys ``outcome``,
+        ``reason``, ``alias_source``, ``alias_target``, ``detail``.
+
+        Callers holding cached runtime state for either id must
+        re-resolve after a ``"linked"`` outcome — a linked alias changes
+        which terminal the ids bind to on the next construction.
+        """
+        from dataclasses import asdict
+
+        from .proxy.vcattach import link_predecessor as _link
+
+        store = self._store
+        inner = getattr(store, "_store", store) if store is not None else None
+        result = _link(
+            predecessor_id,
+            stable_id,
+            inner,
+            cross_worker_invalidate=cross_worker_invalidate,
+            session_state_provider=getattr(
+                self, "_session_state_provider", None,
+            ),
+        )
+        return asdict(result)
 
     def close(self) -> None:
         store = getattr(self, "_store", None)

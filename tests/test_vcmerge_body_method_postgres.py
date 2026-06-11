@@ -33,11 +33,12 @@ from virtual_context.core.exceptions import (
     MergeAuditMissing,
     MergeBusy,
 )
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 
 pytestmark = [
     pytest.mark.skipif(
-        not os.environ.get("DATABASE_URL"),
+        not pg_dsn(),
         reason="DATABASE_URL not set: Postgres smoke skipped",
     ),
     pytest.mark.regression("VCATTACH-DATALOSS-2026-04-26"),
@@ -52,11 +53,11 @@ def pg_store():
     prefix.
     """
     from virtual_context.storage.postgres import PostgresStore
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn)
     yield store
     try:
-        conn = store._get_conn()
+        conn = pg_test_conn()
         for tbl in (
             "merge_post_commit_pending", "merge_audit",
             "tag_aliases", "tag_summaries", "tag_summary_embeddings",
@@ -118,7 +119,7 @@ def test_pg_body_raises_merge_audit_missing_without_reservation(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     with pytest.raises(MergeAuditMissing):
@@ -139,7 +140,7 @@ def test_pg_body_refuses_cross_tenant_source(pg_store):
     tid_b = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid_a, tgt)  # target under tenant A
     _seed_conversation(conn, tid_b, src)  # source under tenant B
     merge_id = _reserve(pg_store, tenant=tid_a, src=src, tgt=tgt)
@@ -157,7 +158,7 @@ def test_pg_body_refuses_lifecycle_epoch_mismatch(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src, lifecycle_epoch=1)
     _seed_conversation(conn, tid, tgt, lifecycle_epoch=5)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -184,7 +185,7 @@ def test_pg_body_moves_segments_and_canonical_turns(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     seg_ref = f"pgsmoke-seg-{uuid.uuid4().hex[:8]}"
@@ -220,7 +221,7 @@ def test_pg_body_bumps_target_request_turn_counter(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     # target counter at 3
@@ -271,7 +272,7 @@ def test_pg_body_captures_prior_alias_target_in_audit(pg_store):
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
     earlier = f"pgsmoke-earlier-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     _seed_conversation(conn, tid, earlier)
@@ -309,7 +310,7 @@ def test_pg_body_post_commit_pendings_written(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -334,7 +335,7 @@ def test_pg_body_returns_merge_stats_with_v14_fields(pg_store):
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -369,7 +370,7 @@ def test_pg_body_active_op_check_propagates_non_undefined_table_error(pg_store, 
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     merge_id = _reserve(pg_store, tenant=tid, src=src, tgt=tgt)
@@ -445,12 +446,12 @@ def test_pg_concurrent_save_request_context_serializes_with_body(pg_store):
     and observes the post-bump counter.
     """
     import psycopg
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     tid = f"pgsmoke-{uuid.uuid4().hex[:8]}"
     src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
     tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
     # Setup with main conn
-    conn = pg_store._get_conn()
+    conn = pg_test_conn()
     _seed_conversation(conn, tid, src)
     _seed_conversation(conn, tid, tgt)
     # source has tool_calls 1..3
@@ -522,3 +523,41 @@ def test_pg_concurrent_save_request_context_serializes_with_body(pg_store):
         assert rt_alloc > max(all_existing)
     finally:
         sub_conn.close()
+
+
+def test_pg_body_dedups_conflicting_turn_tool_outputs(pg_store):
+    """Identical (turn_number, tool_output_ref) in source AND target —
+    the overlapping-re-ingest shape — must dedup (target wins), not
+    abort the merge on the composite primary key."""
+    conv_src = f"pgsmoke-src-{uuid.uuid4().hex[:8]}"
+    conv_tgt = f"pgsmoke-tgt-{uuid.uuid4().hex[:8]}"
+    conn = pg_test_conn()
+    _seed_conversation(conn, "pgsmoke-t", conv_src)
+    _seed_conversation(conn, "pgsmoke-t", conv_tgt)
+    for conv in (conv_src, conv_tgt):
+        conn.execute(
+            "INSERT INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref) "
+            "VALUES (%s, 0, 'tool_dup')",
+            (conv,),
+        )
+    conn.execute(
+        "INSERT INTO turn_tool_outputs (conversation_id, turn_number, tool_output_ref) "
+        "VALUES (%s, 5, 'tool_only_src')",
+        (conv_src,),
+    )
+    merge_id = _reserve(pg_store, tenant="pgsmoke-t", src=conv_src, tgt=conv_tgt)
+    stats = pg_store.merge_conversation_data(
+        merge_id=merge_id, tenant_id="pgsmoke-t",
+        source_conversation_id=conv_src, target_conversation_id=conv_tgt,
+        expected_target_lifecycle_epoch=1, source_label_at_merge="lbl",
+    )
+    rows = conn.execute(
+        "SELECT turn_number, tool_output_ref FROM turn_tool_outputs "
+        "WHERE conversation_id = %s ORDER BY turn_number",
+        (conv_tgt,),
+    ).fetchall()
+    assert [(r["turn_number"], r["tool_output_ref"]) for r in rows] == [
+        (0, "tool_dup"), (5, "tool_only_src"),
+    ]
+    assert stats.rows_moved.get("turn_tool_outputs") == 1
+    assert stats.rows_moved.get("turn_tool_outputs__conflicts_deleted") == 1

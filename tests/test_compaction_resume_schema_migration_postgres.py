@@ -8,9 +8,10 @@ import os
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import pytest
+from tests.pg_helpers import pg_dsn, pg_test_conn
 
 pytestmark = pytest.mark.skipif(
-    not os.environ.get("DATABASE_URL"),
+    not pg_dsn(),
     reason="DATABASE_URL not set; skipping Postgres integration test.",
 )
 
@@ -27,17 +28,17 @@ TARGETS = [
 
 
 def _columns_of(store: PostgresStore, table: str) -> set[str]:
-    conn = store._get_conn()
+    conn = pg_test_conn()
     rows = conn.execute(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name = %s",
         (table,),
     ).fetchall()
-    return {r[0] for r in rows}
+    return {r["column_name"] for r in rows}
 
 
 def test_migration_adds_all_five_operation_id_columns_postgres():
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn=dsn)  # construction triggers schema
     for table, col in TARGETS:
         cols = _columns_of(store, table)
@@ -54,9 +55,9 @@ def test_ensure_canonical_turn_views_survives_underlying_column_add_postgres():
     deploy: ``InvalidTableDefinition: cannot change name of view column
     "turn_number" to "compaction_operation_id"``.
     """
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     store = PostgresStore(dsn=dsn)
-    conn = store._get_conn()
+    conn = pg_test_conn()
 
     # Simulate the pre-fix state: drop the view, re-create it without the
     # compaction_operation_id column in its select-list (as the branch
@@ -90,7 +91,7 @@ def test_ensure_canonical_turn_views_survives_underlying_column_add_postgres():
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name = 'canonical_turns_ordinal'"
     ).fetchall()
-    names = {r[0] for r in cols}
+    names = {r["column_name"] for r in cols}
     assert "compaction_operation_id" in names, (
         f"View must expose compaction_operation_id after migration; got {names}"
     )
@@ -111,7 +112,7 @@ def test_concurrent_workers_racing_canonical_turn_view_migration_postgres():
     """
     import threading
 
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     # Two independent stores → two connections → true concurrency.
     store_a = PostgresStore(dsn=dsn)
     store_b = PostgresStore(dsn=dsn)
@@ -137,12 +138,12 @@ def test_concurrent_workers_racing_canonical_turn_view_migration_postgres():
     assert not errors, f"Concurrent view migration raised: {errors!r}"
 
     # Final state must still have the view with the expected columns.
-    conn = store_a._get_conn()
+    conn = pg_test_conn()
     cols = conn.execute(
         "SELECT column_name FROM information_schema.columns "
         "WHERE table_name = 'canonical_turns_ordinal'"
     ).fetchall()
-    names = {r[0] for r in cols}
+    names = {r["column_name"] for r in cols}
     assert "turn_number" in names
     assert "compaction_operation_id" in names
 
@@ -151,23 +152,23 @@ def test_migration_backfills_null_operation_id_to_zero_uuid_postgres():
     """Same spec contract as SQLite test. Legacy rows get the
     zero-UUID sentinel, never NULL, after migration.
     """
-    dsn = os.environ["DATABASE_URL"]
+    dsn = pg_dsn()
     ZERO_UUID = "00000000-0000-0000-0000-000000000000"
     store = PostgresStore(dsn=dsn)
-    conn = store._get_conn()
+    conn = pg_test_conn()
     # Null out any operation_id to simulate pre-migration state, then
     # re-trigger the migration helper and verify backfill fires.
     conn.execute("UPDATE segments SET operation_id = NULL")
     store._ensure_compaction_scoping_columns()
     n_null = conn.execute(
-        "SELECT COUNT(*) FROM segments WHERE operation_id IS NULL"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS n FROM segments WHERE operation_id IS NULL"
+    ).fetchone()["n"]
     assert n_null == 0, (
         f"After backfill, no segments row should have NULL operation_id; "
         f"got {n_null}"
     )
     n_zero = conn.execute(
-        "SELECT COUNT(*) FROM segments WHERE operation_id = %s",
+        "SELECT COUNT(*) AS n FROM segments WHERE operation_id = %s",
         (ZERO_UUID,),
-    ).fetchone()[0]
+    ).fetchone()["n"]
     assert n_zero >= 0  # zero-UUID count depends on pre-existing data
