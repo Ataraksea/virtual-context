@@ -69,3 +69,4 @@ extraneous/paper/*.png
 
 # Riptide artifacts (cloud-synced)
 .humanlayer/tasks/
+.codegraph/codegraph.db
