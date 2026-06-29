@@ -15,10 +15,12 @@ paging:
   auto_promote: true
   auto_evict: true
   max_tool_loops: 10
+  autonomous_models:
+    - gpt-5.5
 
 tag_generator:
   type: "llm"
-  provider: "vertex_flush_memories"  # ↔ Hermes auxiliary.flush_memories
+  provider: "Azure-GPT-5.5"  # ↔ Hermes auxiliary.flush_memories
   max_tags: 10
   min_tags: 5
   max_tokens: 8192
@@ -61,19 +63,16 @@ compaction:
   llm_token_overhead: 2000
 
 summarization:
-  provider: "vertex_compression"  # ↔ Hermes auxiliary.compression
+  provider: "Azure-GPT-5.5"  # ↔ Hermes auxiliary.compression
   max_tokens: 1000
   temperature: 0.3
 
 providers:
-  vertex:   # ↔ auxiliary.flush_memories  (per-turn tag + fact extraction)
-    type: "vertex"
-    credentials_path: "D:/AppData/Local/hermes/janeagi-496912-d8d1d7f16e80.json"
-    region: "global"
-    model: "google/gemini-3.5-flash"
-    timeout: 30
-    extra_body:
-      reasoning_effort: "minimal"
+  Azure-GPT-5.5:
+    type: "generic_openai"
+    base_url: "wss://janeagi-foundry-resource.services.ai.azure.com/openai/v1"
+    api_key_env: "AZURE_FOUNDRY_API_KEY"
+    model: "gpt-5.5"
 storage:
   backend: "sqlite"
   sqlite:
@@ -84,12 +83,12 @@ facts:
 
 supersession:
   enabled: true
-  provider: "vertex_curator"  # ↔ Hermes auxiliary.curator
+  provider: "Azure-GPT-5.5"  # ↔ Hermes auxiliary.curator
   batch_size: 20
 
 curation:
   enabled: true
-  provider: "vertex_curator"  # ↔ Hermes auxiliary.curator
+  provider: "Azure-GPT-5.5"  # ↔ Hermes auxiliary.curator
   max_response_tokens: 2048
 
 tool_output:
