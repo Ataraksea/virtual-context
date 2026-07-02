@@ -18,10 +18,12 @@ paging:
   autonomous_models:
     - gpt-5.5
     - gemini-3.5-flash
+    - model-router
 
 tag_generator:
   type: "llm"
-  provider: "gemini-3.5-flash"
+  provider: "google"
+  model: "gemini-3.5-flash"
   max_tags: 10
   min_tags: 5
   max_tokens: 8192
@@ -64,20 +66,15 @@ compaction:
   llm_token_overhead: 2000
 
 summarization:
-  provider: "gemini-3.5-flash"  # ↔ Hermes auxiliary.compression
+  provider: "google"  # ↔ Hermes auxiliary.compression
+  model: "gemini-3.5-flash"
   max_tokens: 1000
   temperature: 0.3
 
 providers:
-  model-router:
+  google:
     type: "generic_openai"
-    base_url: "http://janeagi-foundry-resource.services.ai.azure.com/openai/v1"
-    api_key_env: "AZURE_FOUNDRY_API_KEY"
-    model: "model-router"
-  gemini-3.5-flash:
-    type: "generic_openai"
-    base_url: "http://localhost:4000/"
-    model: "gemini-3.5-flash"
+    base_url: "http://localhost:4000/v1"
 storage:
   backend: "sqlite"
   sqlite:
@@ -88,12 +85,14 @@ facts:
 
 supersession:
   enabled: true
-  provider: "gemini-3.5-flash"  # ↔ Hermes auxiliary.curator
+  provider: "google"
+  model: "gemini-3.5-flash"  # ↔ Hermes auxiliary.curator
   batch_size: 20
 
 curation:
   enabled: true
-  provider: "gemini-3.5-flash"  # ↔ Hermes auxiliary.curator
+  provider: "google"
+  model: "gemini-3.5-flash"  # ↔ Hermes auxiliary.curator
   max_response_tokens: 2048
 
 tool_output:
