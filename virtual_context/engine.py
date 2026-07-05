@@ -152,8 +152,27 @@ class VirtualContextEngine:
             self._embedding_provider = embedding_provider
         else:
             from .core.embedding_provider import EmbeddingProvider
+            emb_base_url = None
+            emb_api_key = None
+            emb_provider_name = self.config.retriever.embedding_provider
+            if emb_provider_name:
+                _emb_pconf = self.config.providers.get(emb_provider_name, {})
+                emb_base_url = _emb_pconf.get("base_url")
+                if emb_base_url:
+                    _emb_key_env = _emb_pconf.get("api_key_env", "")
+                    emb_api_key = _emb_pconf.get("api_key") or (
+                        os.environ.get(_emb_key_env, "") if _emb_key_env else ""
+                    )
+                else:
+                    logger.warning(
+                        "retrieval.embedding_provider=%r not found in providers "
+                        "config or missing base_url; falling back to local "
+                        "sentence-transformers", emb_provider_name,
+                    )
             self._embedding_provider = EmbeddingProvider(
                 model_name=self.config.retriever.embedding_model,
+                base_url=emb_base_url,
+                api_key=emb_api_key or None,
             )
 
         self._conversation_generation = 0

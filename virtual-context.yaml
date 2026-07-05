@@ -7,7 +7,7 @@
 
 version: "0.2"
 storage_root: ".virtualcontext"
-context_window: 64000
+context_window: 60000
 token_counter: "estimate"
 
 paging:
@@ -56,7 +56,7 @@ tag_rules:
 
 compaction:
   soft_threshold: 0.70
-  hard_threshold: 0.85
+  hard_threshold: 0.9
   protected_recent_turns: 6
   overflow_buffer: 1.2
   summary_ratio: 0.15
@@ -66,7 +66,7 @@ compaction:
   llm_token_overhead: 2000
 
 summarization:
-  provider: "google"  # ↔ Hermes auxiliary.compression
+  provider: "google"
   model: "gemini-3.5-flash"
   max_tokens: 1000
   temperature: 0.3
@@ -86,13 +86,13 @@ facts:
 supersession:
   enabled: true
   provider: "google"
-  model: "gemini-3.5-flash"  # ↔ Hermes auxiliary.curator
+  model: "gemini-3.5-flash"
   batch_size: 20
 
 curation:
   enabled: true
   provider: "google"
-  model: "gemini-3.5-flash"  # ↔ Hermes auxiliary.curator
+  model: "gemini-3.5-flash"
   max_response_tokens: 2048
 
 tool_output:
@@ -103,21 +103,24 @@ tool_output:
   default_tail_ratio: 0.4
 
 assembly:
-  core_context_max_tokens: 18000
-  tag_context_max_tokens: 30000
-  facts_max_tokens: 20000
+  core_context_max_tokens: 9000
+  tag_context_max_tokens: 15000
+  facts_max_tokens: 10000
   context_hint_enabled: true
-  context_hint_max_tokens: 2000
+  context_hint_max_tokens: 1000
   core_files:
-    - path: "D:/Documents/hermes/SOUL.md"
+    - path: "~/.hermes/SOUL.md"
       priority: 10
 
 retrieval:
   skip_active_tags: true
   active_tag_lookback: 4
   inbound_tagger_type: "embedding"
-  embedding_model: "all-MiniLM-L6-v2"
-  embedding_threshold: 0.3
+  embedding_model: "gemini-embedding-001"
+  embedding_provider: "google"   # routes embeddings via providers.google (litellm /v1/embeddings)
+  embedding_threshold: 0.55
+  scoring:
+    embedding_min_threshold: 0.5   # gemini similarity floor is ~0.5, unlike MiniLM
   strategy_config:
     default:
       min_overlap: 1

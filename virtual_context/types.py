@@ -953,6 +953,9 @@ class RetrieverConfig:
     anchorless_lookback: int = 6           # how many recent turns for working set
     inbound_tagger_type: str = "embedding"  # "embedding" (default) or "llm"
     embedding_model: str = "all-MiniLM-L6-v2"
+    # Name of a block in `providers:` to route embeddings through its
+    # OpenAI-compatible /embeddings endpoint. Empty = local sentence-transformers.
+    embedding_provider: str = ""
     embedding_threshold: float = 0.3
     prefetch_facts: bool = True            # filter facts by query tags instead of fetching all
     scoring: ScoringConfig = field(default_factory=ScoringConfig)

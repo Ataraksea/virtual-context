@@ -296,6 +296,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         anchorless_lookback=retrieval_raw.get("anchorless_lookback", _ret_defaults.anchorless_lookback),
         inbound_tagger_type=retrieval_raw.get("inbound_tagger_type", _ret_defaults.inbound_tagger_type),
         embedding_model=retrieval_raw.get("embedding_model", _ret_defaults.embedding_model),
+        embedding_provider=retrieval_raw.get("embedding_provider", _ret_defaults.embedding_provider),
         embedding_threshold=retrieval_raw.get("embedding_threshold", _ret_defaults.embedding_threshold),
         scoring=scoring_config,
     )
