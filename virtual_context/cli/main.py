@@ -507,6 +507,13 @@ def cmd_proxy(args):
         )
 
 
+def cmd_mcp(args):
+    if args.config:
+        os.environ["VIRTUAL_CONTEXT_CONFIG"] = os.path.abspath(args.config)
+    from ..mcp.server import serve
+    serve()
+
+
 def cmd_retrieve(args):
     from ..engine import VirtualContextEngine
 
@@ -1858,6 +1865,9 @@ def main():
         help="Run replay without TUI (requires --replay)",
     )
 
+    # mcp
+    mcp_parser = subparsers.add_parser("mcp", help="Start the FastMCP server")
+
     # proxy
     proxy_parser = subparsers.add_parser("proxy", help="Start HTTP proxy for LLM enrichment")
     proxy_parser.add_argument(
@@ -2082,6 +2092,8 @@ def main():
         cmd_aliases(args)
     elif args.command == "proxy":
         cmd_proxy(args)
+    elif args.command == "mcp":
+        cmd_mcp(args)
     elif args.command == "presets":
         cmd_presets(args)
     elif args.command == "daemon":
