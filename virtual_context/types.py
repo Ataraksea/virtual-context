@@ -1032,6 +1032,7 @@ class StorageConfig:
     falkordb_host: str = "localhost"
     falkordb_port: int = 6379
     falkordb_password: str = ""
+    falkordb_username: str = ""
 
 
 @dataclass

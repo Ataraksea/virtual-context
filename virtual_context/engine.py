@@ -870,6 +870,7 @@ class VirtualContextEngine:
                 host=self.config.storage.falkordb_host,
                 port=self.config.storage.falkordb_port,
                 password=self.config.storage.falkordb_password,
+                username=self.config.storage.falkordb_username,
             )
             if self.config.storage.postgres_dsn:
                 from .storage.postgres import PostgresStore

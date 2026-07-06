@@ -214,6 +214,7 @@ def _build_config(raw: dict[str, Any], *, validate: bool = True) -> VirtualConte
         falkordb_host=fdb_raw.get("host", _sto_defaults.falkordb_host),
         falkordb_port=fdb_raw.get("port", _sto_defaults.falkordb_port),
         falkordb_password=fdb_raw.get("password", _sto_defaults.falkordb_password),
+        falkordb_username=fdb_raw.get("username", _sto_defaults.falkordb_username),
     )
 
     # Search (find_quote excerpts and snippet lengths)

@@ -27,9 +27,9 @@ class FalkorDBFactStore:
 
     def __init__(
         self, host: str = "localhost", port: int = 6379,
-        password: str = "", graph_name: str = "vc_facts",
+        password: str = "", username: str = "", graph_name: str = "vc_facts",
     ) -> None:
-        self._client = fdb.FalkorDB(host=host, port=port, password=password or None)
+        self._client = fdb.FalkorDB(host=host, port=port, username=username or None, password=password or None)
         self._graph = self._client.select_graph(graph_name)
         self._ensure_schema()
 
