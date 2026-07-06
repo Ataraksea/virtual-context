@@ -7,7 +7,7 @@
 
 version: "0.2"
 storage_root: ".virtualcontext"
-context_window: 60000
+context_window: 90000
 token_counter: "estimate"
 
 paging:
@@ -16,14 +16,12 @@ paging:
   auto_evict: true
   max_tool_loops: 10
   autonomous_models:
-    - gpt-5.5
-    - gemini-3.5-flash
-    - model-router
+    - vertex_ai/gemini-3.5-flash
 
 tag_generator:
   type: "llm"
   provider: "google"
-  model: "gemini-3.5-flash"
+  model: "vertex_ai/gemini-3.5-flash"
   max_tags: 10
   min_tags: 5
   max_tokens: 8192
@@ -67,7 +65,7 @@ compaction:
 
 summarization:
   provider: "google"
-  model: "gemini-3.5-flash"
+  model: "vertex_ai/gemini-3.5-flash"
   max_tokens: 1000
   temperature: 0.3
 
@@ -86,13 +84,13 @@ facts:
 supersession:
   enabled: true
   provider: "google"
-  model: "gemini-3.5-flash"
+  model: "vertex_ai/gemini-3.5-flash"
   batch_size: 20
 
 curation:
   enabled: true
   provider: "google"
-  model: "gemini-3.5-flash"
+  model: "vertex_ai/gemini-3.5-flash"
   max_response_tokens: 2048
 
 tool_output:
@@ -103,8 +101,8 @@ tool_output:
   default_tail_ratio: 0.4
 
 assembly:
-  core_context_max_tokens: 9000
-  tag_context_max_tokens: 15000
+  core_context_max_tokens: 13500
+  tag_context_max_tokens: 22500
   facts_max_tokens: 10000
   context_hint_enabled: true
   context_hint_max_tokens: 1000
@@ -116,7 +114,7 @@ retrieval:
   skip_active_tags: true
   active_tag_lookback: 4
   inbound_tagger_type: "embedding"
-  embedding_model: "gemini-embedding-001"
+  embedding_model: " vertex_ai/gemini-embedding-001"
   embedding_provider: "google"   # routes embeddings via providers.google (litellm /v1/embeddings)
   embedding_threshold: 0.55
   scoring:
