@@ -7,7 +7,7 @@
 
 version: "0.2"
 storage_root: ".virtualcontext"
-context_window: 90000
+context_window: 100000
 token_counter: "estimate"
 
 paging:
@@ -53,7 +53,7 @@ tag_rules:
     priority: 5
 
 compaction:
-  soft_threshold: 0.70
+  soft_threshold: 0.7
   hard_threshold: 0.9
   protected_recent_turns: 6
   overflow_buffer: 1.2
@@ -101,11 +101,11 @@ tool_output:
   default_tail_ratio: 0.4
 
 assembly:
-  core_context_max_tokens: 13500
-  tag_context_max_tokens: 22500
-  facts_max_tokens: 10000
+  core_context_max_tokens: 17500
+  tag_context_max_tokens: 25000
+  facts_max_tokens: 17500
   context_hint_enabled: true
-  context_hint_max_tokens: 1000
+  context_hint_max_tokens: 1750
   core_files:
     - path: "~/.hermes/SOUL.md"
       priority: 10
